@@ -70,6 +70,15 @@ Claude Code real (testados com payloads de exemplo).
 
 ## Fase 4 — Experiência e integração
 
+**Status (21/11/2026):** 4.1, 4.2, 4.3, 4.4 e 4.6 implementados e validados localmente (clippy
+`-D warnings`, 12 testes de integração, lintian sem avisos, instalação no Ubuntu 24.04). `/metrics` com 252
+séries no formato do Prometheus; ntfy e webhook entregues a um receptor HTTP local; o Chromium não aponta
+erros de instalabilidade da PWA; `pulse-tray` registrado na bandeja do GNOME e com menu via D-Bus;
+comparação "hoje × ontem" desenhada. De bônus, o alocador do glibc foi ajustado (`mallopt`) e o RSS do
+daemon caiu de ~90 MB para ~6 MB. **Pendente:** 4.5 (inglês), e Telegram/Discord reais não testados.
+O `pulse-tray` usa Python + D-Bus porque o GTK3 aborta neste GNOME 50 (esquema de configurações
+incompatível).
+
 | # | Item | Esforço | Por quê / o quê |
 |---|---|---|---|
 | 4.1 | **Endpoint `/metrics` (Prometheus)** | P | Exportar CPU, memória, discos, rede, alertas e tokens por agente para quem já usa Grafana. |

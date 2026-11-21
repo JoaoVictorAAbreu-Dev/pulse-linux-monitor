@@ -14,6 +14,10 @@ pub const INDEX_HTML: &str = include_str!("ui/index.html");
 pub const APP_CSS: &str = include_str!("ui/app.css");
 pub const APP_JS: &str = include_str!("ui/app.js");
 pub const FAVICON: &str = include_str!("ui/favicon.svg");
+pub const MANIFEST: &str = include_str!("ui/manifest.webmanifest");
+pub const SW_JS: &str = include_str!("ui/sw.js");
+pub const ICON_192: &[u8] = include_bytes!("ui/pulse-icon-192.png");
+pub const ICON_512: &[u8] = include_bytes!("ui/pulse-icon-512.png");
 
 #[derive(Debug, PartialEq)]
 pub enum Auth {
@@ -29,6 +33,16 @@ pub fn authenticate(sh: &Shared, req: &Request) -> (Auth, bool) {
     if let Some(h) = req.header("x-pulse-token") {
         presented = true;
         if auth::ct_eq(h.trim().as_bytes(), token.as_bytes()) {
+            return (Auth::Header, true);
+        }
+    }
+    // Prometheus e outras ferramentas usam "Authorization: Bearer <token>"
+    if let Some(b) = req
+        .header("authorization")
+        .and_then(|h| h.strip_prefix("Bearer "))
+    {
+        presented = true;
+        if auth::ct_eq(b.trim().as_bytes(), token.as_bytes()) {
             return (Auth::Header, true);
         }
     }
@@ -79,6 +93,10 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
             | ("GET", "/app.css")
             | ("GET", "/app.js")
             | ("GET", "/favicon.svg")
+            | ("GET", "/manifest.webmanifest")
+            | ("GET", "/sw.js")
+            | ("GET", "/icon-192.png")
+            | ("GET", "/icon-512.png")
             | ("POST", "/api/logout")
     );
     // Bloqueio por força bruta: IP com muitas falhas recentes não autentica.
@@ -121,6 +139,21 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         }
         ("GET", "/favicon.svg") => {
             return Outcome::Resp(Response::new(200, "image/svg+xml", FAVICON))
+        }
+        ("GET", "/manifest.webmanifest") => {
+            return Outcome::Resp(Response::new(200, "application/manifest+json", MANIFEST))
+        }
+        ("GET", "/sw.js") => {
+            return Outcome::Resp(
+                Response::new(200, "text/javascript; charset=utf-8", SW_JS)
+                    .with_header("Service-Worker-Allowed", "/"),
+            )
+        }
+        ("GET", "/icon-192.png") => {
+            return Outcome::Resp(Response::new(200, "image/png", ICON_192))
+        }
+        ("GET", "/icon-512.png") => {
+            return Outcome::Resp(Response::new(200, "image/png", ICON_512))
         }
         ("GET", "/api/health") => {
             let st = sh.lock();
@@ -402,6 +435,55 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         ("GET", "/api/disk/cleanup") => Response::ok_json(disk::cleanup_candidates()),
         ("GET", "/api/agents") => agents_json(sh),
         ("GET", "/api/agents/hooks") => hooks_info(),
+        ("GET", "/metrics") | ("GET", "/api/metrics") => {
+            let (snap, agents, usage) = {
+                let st = sh.lock();
+                (
+                    st.snapshot.clone(),
+                    st.agents_json.clone(),
+                    st.usage_json.clone(),
+                )
+            };
+            Response::new(
+                200,
+                "text/plain; version=0.0.4; charset=utf-8",
+                crate::metrics::render(&snap, &agents, &usage),
+            )
+        }
+        ("GET", "/api/config/notify") => Response::ok_json(
+            sh.channels
+                .read()
+                .map(|c| c.to_public_json())
+                .unwrap_or_else(|_| "{}".into()),
+        ),
+        ("POST", "/api/config/notify") => match body_json(req) {
+            Err(r) => r,
+            Ok(v) => config_notify(sh, &v, peer),
+        },
+        ("POST", "/api/notify/test") => {
+            let ch = sh.channels.read().map(|c| c.clone()).unwrap_or_default();
+            let host = sys::read_trim("/proc/sys/kernel/hostname").unwrap_or_default();
+            let r = crate::notify::send(
+                &ch,
+                &crate::notify::Message {
+                    title: "Pulse: teste de notificação".into(),
+                    body: "Se você recebeu isto, o canal está funcionando.".into(),
+                    severity: "info".into(),
+                    host,
+                },
+            );
+            auth::audit(
+                "notify.test",
+                &format!("{} canal(is)", r.len()),
+                "enviado",
+                peer,
+            );
+            Response::ok_json(
+                Obj::new()
+                    .raw("results", &crate::notify::results_json(&r))
+                    .finish(),
+            )
+        }
         ("POST", "/api/config/agents") => match body_json(req) {
             Err(r) => r,
             Ok(v) => config_agents(sh, &v, peer),
@@ -446,8 +528,13 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
                     st.hook_log.append(&e.to_json());
                     drop(st);
                     sh.tick.notify_all();
-                    if e.state == "atencao" && prefs.notify_attention {
-                        notify_attention(sh, &e);
+                    let forward = sh
+                        .channels
+                        .read()
+                        .map(|c| c.agents && c.any())
+                        .unwrap_or(false);
+                    if e.state == "atencao" && (prefs.notify_attention || forward) {
+                        notify_attention(sh, &e, prefs.notify_attention);
                     }
                     Response::ok_json("{\"ok\":true}")
                 }
@@ -524,6 +611,7 @@ fn du_route(sh: &Arc<Shared>, req: &Request) -> Response {
         let _ = sys::lower_thread_priority(10);
         let res =
             disk::du_with_progress(&k2, 5_000_000, 180_000, Some(&progress)).map(|r| r.to_json());
+        sys::release_free_memory();
         let mut jobs = sh2.du_jobs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(j) = jobs.get_mut(&k2) {
             j.result = Some((std::time::Instant::now(), res));
@@ -577,6 +665,89 @@ fn hooks_info() -> Response {
             )
             .finish(),
     )
+}
+
+/// Grava [notify] no config.toml. Campo ausente = mantém; "" = remove.
+fn config_notify(sh: &Shared, v: &Value, peer: &str) -> Response {
+    let mut ch = sh.channels.read().map(|c| c.clone()).unwrap_or_default();
+    type Check = fn(&str) -> bool;
+    let fields: [(&str, Check); 5] = [
+        ("ntfy_url", crate::notify::valid_url),
+        ("ntfy_token", settings::valid_ntfy_token),
+        ("webhook_url", crate::notify::valid_url),
+        ("telegram_bot_token", settings::valid_telegram_token),
+        ("telegram_chat_id", settings::valid_chat_id),
+    ];
+    for (k, ok) in fields {
+        let Some(x) = v.get(k) else { continue };
+        let Some(s) = x.as_str() else {
+            return Response::error(400, &format!("{} precisa ser texto", k));
+        };
+        let s = s.trim();
+        let val = if s.is_empty() {
+            None
+        } else if ok(s) {
+            Some(s.to_string())
+        } else {
+            return Response::error(400, &format!("valor inválido em {}", k));
+        };
+        match k {
+            "ntfy_url" => ch.ntfy_url = val,
+            "ntfy_token" => ch.ntfy_token = val,
+            "webhook_url" => ch.webhook_url = val,
+            "telegram_bot_token" => ch.telegram_bot_token = val,
+            _ => ch.telegram_chat_id = val,
+        }
+    }
+    for k in ["alerts", "agents"] {
+        if let Some(x) = v.get(k) {
+            let Some(b) = x.as_bool() else {
+                return Response::error(400, &format!("{} precisa ser true ou false", k));
+            };
+            if k == "alerts" {
+                ch.alerts = b
+            } else {
+                ch.agents = b
+            }
+        }
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (k, val) in [
+        ("ntfy_url", &ch.ntfy_url),
+        ("ntfy_token", &ch.ntfy_token),
+        ("webhook_url", &ch.webhook_url),
+        ("telegram_bot_token", &ch.telegram_bot_token),
+        ("telegram_chat_id", &ch.telegram_chat_id),
+    ] {
+        if let Some(s) = val {
+            pairs.push((k.to_string(), json::quote(s)));
+        }
+    }
+    pairs.push(("alerts".into(), ch.alerts.to_string()));
+    pairs.push(("agents".into(), ch.agents.to_string()));
+    let src = std::fs::read_to_string(&sh.config_path).unwrap_or_default();
+    let body = settings::rewrite_section(&src, "notify", &pairs, true);
+    let res = settings::write_atomic(&sh.config_path, &body);
+    // a auditoria registra só que mudou, nunca os valores
+    auth::audit(
+        "config.notify",
+        &sh.config_path.to_string_lossy(),
+        res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+        peer,
+    );
+    match res {
+        Ok(()) => {
+            let j = ch.to_public_json();
+            if let Ok(mut c) = sh.channels.write() {
+                *c = ch;
+            }
+            Response::ok_json(Obj::new().b("ok", true).raw("notify", &j).finish())
+        }
+        Err(e) => Response::error(
+            500,
+            &format!("não foi possível gravar a configuração: {}", e),
+        ),
+    }
 }
 
 /// Grava [agents] e [prices] no config.toml e aplica na hora.
@@ -660,7 +831,7 @@ fn config_agents(sh: &Shared, v: &Value, peer: &str) -> Response {
 }
 
 /// Avisa no desktop que um agente pede atenção (no máximo 1×/min por sessão).
-fn notify_attention(sh: &Shared, e: &hooks::HookEvent) {
+fn notify_attention(sh: &Shared, e: &hooks::HookEvent, desktop: bool) {
     {
         let mut sent = sh.attention_sent.lock().unwrap_or_else(|x| x.into_inner());
         if let Some(t) = sent.get(&e.session) {
@@ -695,7 +866,21 @@ fn notify_attention(sh: &Shared, e: &hooks::HookEvent) {
         }
         body.push_str(&format!("quer usar {}", e.tool));
     }
-    crate::state::notify_text(&format!("{} está esperando você", agent), &body, "normal");
+    if desktop {
+        crate::state::notify_text(&format!("{} está esperando você", agent), &body, "normal");
+    }
+    let ch = sh.channels.read().map(|c| c.clone()).unwrap_or_default();
+    if ch.agents && ch.any() {
+        crate::notify::send_async(
+            ch,
+            crate::notify::Message {
+                title: format!("{} está esperando você", agent),
+                body,
+                severity: "aviso".into(),
+                host: sys::read_trim("/proc/sys/kernel/hostname").unwrap_or_default(),
+            },
+        );
+    }
 }
 
 fn agents_json(sh: &Shared) -> Response {

@@ -25,7 +25,7 @@ Baixe o `.deb` da página de Releases do GitHub (amd64 e arm64) ou gere localmen
 ```sh
 packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
 packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
-sudo apt install ./target/deb/pulse-monitor_0.3.0_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.4.0_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 ```
 
@@ -34,6 +34,32 @@ navegador), man pages, autocompletar do bash, exemplos de `config.toml`/`agents.
 aplicativos e o ícone. O serviço **não** é habilitado automaticamente para todos os usuários.
 Se você também usou o `install.sh`, a unidade em `~/.config/systemd/user/` tem prioridade; remova-a
 (e `~/.local/bin/pulse*`) para usar a versão do pacote.
+
+## Integrações
+
+- **Prometheus/Grafana**: `GET /metrics` no formato de texto do Prometheus (CPU por modo e núcleo, carga,
+  PSI, memória, swap, sistemas de arquivos, discos, rede, temperaturas, GPU, processos, alertas, agentes
+  e tokens de hoje por modelo). Autentique com `Authorization: Bearer <token>`:
+
+  ```yaml
+  scrape_configs:
+    - job_name: pulse
+      static_configs: [{ targets: ["127.0.0.1:7878"] }]
+      authorization: { credentials_file: /home/VOCÊ/.config/pulse/token }
+  ```
+- **Notificações externas** (`[notify]` ou tela Alertas → Canais externos): ntfy (com token opcional),
+  webhook JSON genérico ou do Discord, e Telegram. Alertas são encaminhados por padrão; "agente pedindo
+  atenção" é opcional. O envio usa o `curl` com URL e segredos pela entrada padrão (nada na linha de
+  comando ou nos logs); títulos com acento vão em RFC 2047 no ntfy. Tópicos do ntfy.sh são públicos para
+  quem souber o nome: use um nome longo e aleatório.
+- **Instalar como app (PWA)**: no Chrome/Brave/Edge, "Instalar Pulse" na barra de endereço. O service
+  worker não guarda dados do sistema offline.
+- **Atalhos de teclado**: `g` + `v/c/m/d/p/s/r/l/a/x` navega entre as telas, `/` busca, `t` alterna o tema,
+  `?` mostra a ajuda.
+- **Ícone na bandeja**: `pulse-tray` mostra CPU/memória no rótulo e alertas e agentes no menu; um clique
+  abre o painel. `pulse-tray --install-autostart` inicia junto com a sessão. Usa o protocolo
+  StatusNotifierItem direto pelo D-Bus (python3-gi/Gio), sem GTK; no GNOME depende da extensão de
+  AppIndicators (padrão no Ubuntu).
 
 ## Uso
 
@@ -140,6 +166,8 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 | `GET /api/disk/usage?path=` · `GET /api/disk/cleanup` | espaço em disco |
 | `GET /api/agents` · `GET /api/agents/hooks` · `POST /api/agents/hooks/install` · `POST /api/agents/hook` | agentes |
 | `GET /api/alerts` | alertas ativos, histórico e regras |
+| `GET /metrics` | exposição para o Prometheus (aceita `Authorization: Bearer`) |
+| `GET /api/config/notify` · `POST /api/config/notify` · `POST /api/notify/test` | canais externos (sem devolver segredos) |
 | `GET /api/config` · `POST /api/config/alerts` | configuração efetiva e edição dos limiares |
 
 ## Segurança
@@ -243,7 +271,11 @@ cargo run -p pulse-daemon -- --port 7979 --interval-ms 500
 Seja honesto com o que existe:
 
 - **SQLite**: o histórico longo é um arquivo texto; não há banco de dados.
-- **Tauri / ícone na bandeja**: só a interface web.
+- **Tauri**: não há app nativo; a interface web pode ser instalada como PWA e há o `pulse-tray` (Python + D-Bus).
+- **Interface em inglês (roadmap 4.5)**: ainda não; a UI é só em pt-BR.
+- **Telegram e Discord**: implementados, mas só testados com um receptor HTTP local (formato das
+  requisições), não contra os serviços reais. O ntfy e o webhook JSON foram testados de ponta a ponta com
+  um receptor local.
 - **Helper polkit próprio**: ações em serviços de sistema chamam `systemctl` e dependem do agente polkit
   da sessão. **Esse fluxo não foi testado.**
 - **SMART**: implementado via `smartctl`, mas **não testado em hardware real** (o smartmontools não

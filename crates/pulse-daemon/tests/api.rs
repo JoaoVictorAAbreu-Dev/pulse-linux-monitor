@@ -111,8 +111,9 @@ fn try_req(
     }
     h.push_str(&format!("Content-Length: {}\r\n\r\n{}", body.len(), body));
     s.write_all(h.as_bytes())?;
-    let mut out = String::new();
-    s.read_to_string(&mut out)?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)?;
+    let out = String::from_utf8_lossy(&raw).into_owned();
     let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
     let status = head
         .split_whitespace()
@@ -664,4 +665,118 @@ fn phase3_agents_prefs_and_hooks() {
     let (_, _, b) = req(&d, "GET", "/api/agents", &h, "");
     assert!(b.contains("\"subagents\":1") && b.contains("\"failures\":1"));
     assert!(b.contains("rm x --password ***") && !b.contains("p4ss"));
+}
+
+#[test]
+fn phase4_metrics_pwa_and_notify_channels() {
+    let env = Env::new("fase4");
+    let d = start(&env, &[]);
+    let tok = env.token();
+
+    // /metrics: Bearer (Prometheus), formato de texto, exige token
+    assert_eq!(req(&d, "GET", "/metrics", &[], "").0, 401);
+    let bearer = format!("Bearer {}", tok);
+    let (st, head, body) = req(&d, "GET", "/metrics", &[("Authorization", &bearer)], "");
+    assert_eq!(st, 200);
+    assert!(head.contains("text/plain; version=0.0.4"));
+    assert!(body.contains("# TYPE pulse_cpu_usage_percent gauge") && body.contains("pulse_up 1"));
+    assert_eq!(
+        req(&d, "GET", "/metrics", &[("Authorization", "Bearer 00")], "").0,
+        401
+    );
+
+    // PWA: manifesto, service worker e ícones são públicos
+    let (st, _, m) = req(&d, "GET", "/manifest.webmanifest", &[], "");
+    assert_eq!(st, 200);
+    assert!(j(&m).get("icons").is_some());
+    assert_eq!(req(&d, "GET", "/sw.js", &[], "").0, 200);
+    assert_eq!(req(&d, "GET", "/icon-192.png", &[], "").0, 200);
+
+    // canais: um receptor HTTP local recebe ntfy e webhook
+    let rx = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = rx.local_addr().unwrap().port();
+    let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let g2 = got.clone();
+    std::thread::spawn(move || {
+        for s in rx.incoming().flatten() {
+            let mut s = s;
+            s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+            let mut buf = vec![0u8; 65536];
+            let mut data = Vec::new();
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        data.extend_from_slice(&buf[..n]);
+                        let t = String::from_utf8_lossy(&data);
+                        if let Some(i) = t.find("\r\n\r\n") {
+                            let len = t[..i]
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if data.len() >= i + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            g2.lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&data).into_owned());
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+        }
+    });
+    let h = [("X-Pulse-Token", tok.as_str())];
+    let cfg = format!(
+        r#"{{"ntfy_url":"http://127.0.0.1:{p}/topico","ntfy_token":"tk_SEGREDO","webhook_url":"http://127.0.0.1:{p}/hook"}}"#,
+        p = port
+    );
+    let (st, _, b) = req(&d, "POST", "/api/config/notify", &h, &cfg);
+    assert_eq!(st, 200, "{}", b);
+    assert!(!b.contains("tk_SEGREDO"), "segredo não volta na resposta");
+    assert_eq!(
+        req(
+            &d,
+            "POST",
+            "/api/config/notify",
+            &h,
+            r#"{"webhook_url":"file:///etc/passwd"}"#
+        )
+        .0,
+        400
+    );
+    let (_, _, b) = req(&d, "GET", "/api/config/notify", &h, "");
+    assert!(!b.contains("tk_SEGREDO") && !b.contains("/topico"));
+    let (st, _, b) = req(&d, "POST", "/api/notify/test", &h, "{}");
+    assert_eq!(st, 200);
+    assert_eq!(
+        j(&b)
+            .get("results")
+            .and_then(|r| r.as_array())
+            .map(|a| a.len()),
+        Some(2),
+        "{}",
+        b
+    );
+    assert!(
+        wait_for(|| got.lock().unwrap().len() >= 2, 10),
+        "dois envios recebidos"
+    );
+    let all = got.lock().unwrap().join("\n---\n");
+    assert!(all.contains("POST /topico") && all.contains("Authorization: Bearer tk_SEGREDO"));
+    assert!(
+        all.contains("Title: =?UTF-8?B?"),
+        "título com acento em RFC 2047"
+    );
+    assert!(all.contains("POST /hook") && all.contains("\"source\":\"pulse\""));
+    let cfgfile = std::fs::read_to_string(env.config().join("config.toml")).unwrap();
+    assert!(cfgfile.contains("[notify]") && cfgfile.contains("tk_SEGREDO"));
+    let audit = std::fs::read_to_string(env.state().join("audit.log")).unwrap();
+    assert!(!audit.contains("tk_SEGREDO"), "auditoria sem segredos");
 }

@@ -47,13 +47,15 @@ install -d "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" \
 install -m 755 "$BIN" "$ROOT/usr/bin/pulse"
 install -m 755 packaging/pulse-hook "$ROOT/usr/bin/pulse-hook"
 install -m 755 packaging/deb/pulse-open "$ROOT/usr/bin/pulse-open"
+install -m 755 packaging/pulse-tray "$ROOT/usr/bin/pulse-tray"
 install -m 644 packaging/deb/pulse.service "$ROOT/usr/lib/systemd/user/pulse.service"
 install -m 644 packaging/deb/pulse.desktop "$ROOT/usr/share/applications/pulse-monitor.desktop"
+install -m 644 packaging/deb/pulse-tray.desktop "$ROOT/usr/share/applications/pulse-tray.desktop"
 install -m 644 assets/logo/pulse-app-icon.svg "$ROOT/usr/share/icons/hicolor/scalable/apps/pulse-monitor.svg"
 install -m 644 packaging/agents.conf.example "$ROOT/usr/share/$PKG/agents.conf.example"
 install -m 644 packaging/config.toml.example "$ROOT/usr/share/$PKG/config.toml.example"
 install -m 644 packaging/deb/pulse.bash-completion "$ROOT/usr/share/bash-completion/completions/pulse"
-for m in pulse pulse-hook pulse-open; do
+for m in pulse pulse-hook pulse-open pulse-tray; do
   gzip -9n < "packaging/deb/$m.1" > "$ROOT/usr/share/man/man1/$m.1.gz"
   chmod 644 "$ROOT/usr/share/man/man1/$m.1.gz"
 done
@@ -71,8 +73,8 @@ Version: $VERSION
 Architecture: $ARCH
 Maintainer: JoaoVictorAAbreu-Dev <noreply@github.com>
 Installed-Size: $SIZE
-Depends: libc6 (>= $GLIBC), systemd
-Recommends: curl, libnotify-bin
+Depends: libc6 (>= $GLIBC), systemd, python3
+Recommends: curl, libnotify-bin, python3-gi
 Suggests: docker.io, xdg-utils
 Section: admin
 Priority: optional

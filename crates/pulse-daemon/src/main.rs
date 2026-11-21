@@ -4,6 +4,8 @@ mod api;
 mod auth;
 mod config;
 mod http;
+mod metrics;
+mod notify;
 mod settings;
 mod state;
 
@@ -24,6 +26,7 @@ fn fail(msg: &str, code: i32) -> ! {
 }
 
 fn main() {
+    pulse_core::sys::tune_allocator();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // 1) arquivo de configuração (padrões < arquivo < flags)
     let cfg_path = config::config_arg(&args).unwrap_or_else(settings::path);
@@ -119,6 +122,12 @@ fn main() {
         warnings,
         prefs,
     );
+    let mut channels = file.channels.clone();
+    channels.alerts = file.notify_alerts.unwrap_or(true);
+    channels.agents = file.notify_agents.unwrap_or(false);
+    if let Ok(mut c) = shared.channels.write() {
+        *c = channels;
+    }
     // O token nunca vai para o log: só o caminho do arquivo.
     eprintln!(
         "pulse: ouvindo em http://{} (intervalo {} ms)",

@@ -1,0 +1,363 @@
+#!/usr/bin/python3
+"""pulse-tray — ícone do Pulse na bandeja (StatusNotifierItem via D-Bus).
+
+Mostra CPU/RAM no rótulo, alertas e o estado dos agentes no menu, e abre o
+painel com um clique. Fala o protocolo StatusNotifierItem + dbusmenu direto
+pelo D-Bus usando só o Gio (python3-gi), sem GTK — funciona com a extensão
+de AppIndicators do GNOME/Ubuntu e com bandejas do KDE/XFCE.
+
+Uso: pulse-tray [--port N] [--install-autostart | --remove-autostart]
+"""
+
+import json
+import time
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+import warnings
+
+# register_object é marcado como obsoleto em PyGObject recente, mas é a
+# forma suportada em todas as versões do Ubuntu LTS ainda em uso.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+try:
+    from gi.repository import Gio, GLib
+except Exception as e:  # pragma: no cover - depende do sistema
+    sys.stderr.write(f"pulse-tray: precisa do python3-gi (Gio): {e}\n")
+    sys.exit(1)
+
+PORT = int(os.environ.get("PULSE_PORT", "7878"))
+INTERVAL_S = 3
+APP_ID = "pulse"
+
+SNI_XML = """
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <property name="XAyatanaLabel" type="s" access="read"/>
+    <property name="XAyatanaLabelGuide" type="s" access="read"/>
+    <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+    <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+    <signal name="NewTitle"/>
+    <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus"><arg name="status" type="s"/></signal>
+    <signal name="XAyatanaNewLabel"><arg name="label" type="s"/><arg name="guide" type="s"/></signal>
+  </interface>
+</node>
+"""
+
+MENU_XML = """
+<node>
+  <interface name="com.canonical.dbusmenu">
+    <property name="Version" type="u" access="read"/>
+    <property name="TextDirection" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="IconThemePath" type="as" access="read"/>
+    <method name="GetLayout">
+      <arg type="i" name="parentId" direction="in"/><arg type="i" name="recursionDepth" direction="in"/>
+      <arg type="as" name="propertyNames" direction="in"/>
+      <arg type="u" name="revision" direction="out"/><arg type="(ia{sv}av)" name="layout" direction="out"/>
+    </method>
+    <method name="GetGroupProperties">
+      <arg type="ai" name="ids" direction="in"/><arg type="as" name="propertyNames" direction="in"/>
+      <arg type="a(ia{sv})" name="properties" direction="out"/>
+    </method>
+    <method name="GetProperty">
+      <arg type="i" name="id" direction="in"/><arg type="s" name="name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+    <method name="Event">
+      <arg type="i" name="id" direction="in"/><arg type="s" name="eventId" direction="in"/>
+      <arg type="v" name="data" direction="in"/><arg type="u" name="timestamp" direction="in"/>
+    </method>
+    <method name="EventGroup">
+      <arg type="a(isvu)" name="events" direction="in"/><arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <method name="AboutToShow">
+      <arg type="i" name="id" direction="in"/><arg type="b" name="needUpdate" direction="out"/>
+    </method>
+    <method name="AboutToShowGroup">
+      <arg type="ai" name="ids" direction="in"/>
+      <arg type="ai" name="updatesNeeded" direction="out"/><arg type="ai" name="idErrors" direction="out"/>
+    </method>
+    <signal name="ItemsPropertiesUpdated">
+      <arg type="a(ia{sv})" name="updatedProps"/><arg type="a(ias)" name="removedProps"/>
+    </signal>
+    <signal name="LayoutUpdated"><arg type="u" name="revision"/><arg type="i" name="parent"/></signal>
+  </interface>
+</node>
+"""
+
+STATES = {
+    "executando": "executando",
+    "atencao": "pedindo atenção",
+    "aguardando": "aguardando",
+    "concluido": "concluído",
+}
+AGENTS = {"claude": "Claude Code", "codex": "Codex", "openclaw": "OpenClaw", "ponto": "Ponto"}
+
+
+def token_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "pulse", "token")
+
+
+def read_token():
+    try:
+        with open(token_path(), encoding="ascii") as f:
+            return "".join(c for c in f.read() if c in "0123456789abcdefABCDEF")
+    except OSError:
+        return ""
+
+
+def api(path):
+    """GET autenticado no daemon local. Devolve JSON ou None."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{PORT}{path}", headers={"X-Pulse-Token": read_token()}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def summarize(snap, agents):
+    """Monta (rótulo, título do tooltip, linhas do menu, precisa_de_atencao)."""
+    if not snap:
+        return "Pulse", "Pulse — daemon indisponível", ["Daemon do Pulse fora do ar"], False
+    cpu = snap.get("cpu", {}).get("total") or 0
+    mem = snap.get("mem", {}).get("pct") or 0
+    label = f"{cpu:.0f}% · {mem:.0f}%"
+    lines = [f"CPU {cpu:.0f}% · memória {mem:.0f}%"]
+    alerts = snap.get("alerts") or []
+    if alerts:
+        lines.append(f"{len(alerts)} alerta(s): " + ", ".join(a.get("title", "?") for a in alerts[:3]))
+    else:
+        lines.append("Sem alertas")
+    attention = bool(alerts)
+
+    now = time.time() * 1000
+    for h in ((agents or {}).get("hooks") or {}).get("sessions", [])[:4]:
+        if now - h.get("ts", 0) > 6 * 3600 * 1000:
+            continue
+        st = h.get("state", "")
+        attention |= st == "atencao"
+        name = AGENTS.get(h.get("agent", ""), h.get("agent", ""))
+        proj = (h.get("cwd") or "").rstrip("/").split("/")[-1]
+        lines.append(f"{name}: {STATES.get(st, st)}" + (f" · {proj}" if proj else ""))
+    title = f"Pulse — CPU {cpu:.0f}% · memória {mem:.0f}%"
+    return label, title, lines, attention
+
+
+class Tray:
+    def __init__(self, bus):
+        self.bus = bus
+        self.label = "Pulse"
+        self.title = "Pulse"
+        self.lines = ["Carregando…"]
+        self.attention = False
+        self.revision = 1
+        self.loop = None
+        self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        sni = Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0]
+        menu = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+        bus.register_object("/StatusNotifierItem", sni, self.sni_call, self.sni_get, None)
+        bus.register_object("/MenuBar", menu, self.menu_call, self.menu_get, None)
+        Gio.bus_own_name_on_connection(bus, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
+        self.register()
+        # re-registra se o host da bandeja reiniciar (ex.: GNOME Shell)
+        bus.signal_subscribe(
+            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus",
+            "org.kde.StatusNotifierWatcher", Gio.DBusSignalFlags.NONE, lambda *a: self.register(),
+        )
+
+    def register(self):
+        try:
+            self.bus.call_sync(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher",
+                "RegisterStatusNotifierItem", GLib.Variant("(s)", (self.name,)), None,
+                Gio.DBusCallFlags.NONE, 2000, None,
+            )
+        except GLib.Error as e:
+            sys.stderr.write(f"pulse-tray: nenhuma bandeja disponível ({e.message})\n")
+
+    # ---- StatusNotifierItem
+    def sni_get(self, conn, sender, path, iface, prop):
+        v = {
+            "Category": GLib.Variant("s", "SystemServices"),
+            "Id": GLib.Variant("s", APP_ID),
+            "Title": GLib.Variant("s", "Pulse"),
+            "Status": GLib.Variant("s", "NeedsAttention" if self.attention else "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", "pulse-monitor"),
+            "IconThemePath": GLib.Variant("s", ""),
+            "AttentionIconName": GLib.Variant("s", "pulse-monitor"),
+            "ToolTip": GLib.Variant("(sa(iiay)ss)", ("pulse-monitor", [], self.title, "\n".join(self.lines[1:]))),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", "/MenuBar"),
+            "XAyatanaLabel": GLib.Variant("s", self.label),
+            "XAyatanaLabelGuide": GLib.Variant("s", "100% · 100%"),
+        }
+        return v.get(prop)
+
+    def sni_call(self, conn, sender, path, iface, method, params, inv):
+        if method in ("Activate", "SecondaryActivate"):
+            open_panel()
+        inv.return_value(None)
+
+    # ---- dbusmenu
+    def items(self):
+        """(id, propriedades) dos itens do menu."""
+        it = [(1, {"label": GLib.Variant("s", "Abrir o painel do Pulse")}), (2, {"type": GLib.Variant("s", "separator")})]
+        for i, line in enumerate(self.lines[:8]):
+            it.append((10 + i, {"label": GLib.Variant("s", line), "enabled": GLib.Variant("b", False)}))
+        it.append((3, {"type": GLib.Variant("s", "separator")}))
+        it.append((4, {"label": GLib.Variant("s", "Esconder o ícone (fechar pulse-tray)")}))
+        return it
+
+    def layout(self):
+        children = [GLib.Variant("(ia{sv}av)", (i, p, [])) for i, p in self.items()]
+        return (0, {"children-display": GLib.Variant("s", "submenu")}, children)
+
+    def menu_get(self, conn, sender, path, iface, prop):
+        return {
+            "Version": GLib.Variant("u", 3),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", []),
+        }.get(prop)
+
+    def menu_call(self, conn, sender, path, iface, method, params, inv):
+        if method == "GetLayout":
+            inv.return_value(GLib.Variant("(u(ia{sv}av))", (self.revision, self.layout())))
+        elif method == "GetGroupProperties":
+            ids = params.unpack()[0]
+            props = [(i, p) for i, p in self.items() if not ids or i in ids]
+            if not ids or 0 in ids:
+                props.insert(0, (0, {"children-display": GLib.Variant("s", "submenu")}))
+            inv.return_value(GLib.Variant("(a(ia{sv}))", (props,)))
+        elif method == "GetProperty":
+            i, name = params.unpack()
+            p = dict(self.items()).get(i, {})
+            inv.return_value(GLib.Variant("(v)", (p.get(name, GLib.Variant("s", "")),)))
+        elif method == "Event":
+            i, event = params.unpack()[:2]
+            if event == "clicked":
+                self.clicked(i)
+            inv.return_value(None)
+        elif method == "EventGroup":
+            for i, event, _d, _t in params.unpack()[0]:
+                if event == "clicked":
+                    self.clicked(i)
+            inv.return_value(GLib.Variant("(ai)", ([],)))
+        elif method == "AboutToShow":
+            inv.return_value(GLib.Variant("(b)", (False,)))
+        elif method == "AboutToShowGroup":
+            inv.return_value(GLib.Variant("(aiai)", ([], [])))
+        else:
+            inv.return_value(None)
+
+    def clicked(self, i):
+        if i == 1:
+            open_panel()
+        elif i == 4 and self.loop:
+            self.loop.quit()
+
+    # ---- atualização
+    def emit(self, path, iface, name, sig=None, args=None):
+        self.bus.emit_signal(None, path, iface, name, GLib.Variant(sig, args) if sig else None)
+
+    def refresh(self):
+        label, title, lines, attention = summarize(api("/api/snapshot"), api("/api/agents"))
+        if label != self.label:
+            self.label = label
+            self.emit("/StatusNotifierItem", "org.kde.StatusNotifierItem", "XAyatanaNewLabel", "(ss)", (label, "100% · 100%"))
+        if (title, lines) != (self.title, self.lines):
+            self.title, self.lines = title, lines
+            self.revision += 1
+            self.emit("/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewToolTip")
+            self.emit("/MenuBar", "com.canonical.dbusmenu", "LayoutUpdated", "(ui)", (self.revision, 0))
+        if attention != self.attention:
+            self.attention = attention
+            self.emit("/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewStatus", "(s)",
+                      ("NeedsAttention" if attention else "Active",))
+        return True
+
+
+def open_panel():
+    for cmd in (["pulse-open"], ["xdg-open", f"http://127.0.0.1:{PORT}/"]):
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            return
+        except OSError:
+            continue
+
+
+AUTOSTART = """[Desktop Entry]
+Type=Application
+Name=Pulse (bandeja)
+Comment=Ícone do Pulse na bandeja com CPU, memória, alertas e agentes
+Exec=pulse-tray
+Icon=pulse-monitor
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+"""
+
+
+def autostart_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "autostart", "pulse-tray.desktop")
+
+
+def main(argv):
+    global PORT
+    args = list(argv)
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return 0
+    if "--port" in args:
+        PORT = int(args[args.index("--port") + 1])
+    if "--install-autostart" in args:
+        os.makedirs(os.path.dirname(autostart_path()), exist_ok=True)
+        with open(autostart_path(), "w", encoding="utf-8") as f:
+            f.write(AUTOSTART)
+        print(f"pulse-tray vai iniciar com a sessão ({autostart_path()})")
+        return 0
+    if "--remove-autostart" in args:
+        try:
+            os.remove(autostart_path())
+            print("início automático removido")
+        except FileNotFoundError:
+            print("início automático já não estava ativo")
+        return 0
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    tray = Tray(bus)
+    tray.refresh()
+    GLib.timeout_add_seconds(INTERVAL_S, tray.refresh)
+    tray.loop = GLib.MainLoop()
+    try:
+        tray.loop.run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

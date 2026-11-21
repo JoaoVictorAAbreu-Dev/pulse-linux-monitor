@@ -53,6 +53,7 @@ pub struct Shared {
     pub config_path: PathBuf,
     pub config_warnings: Vec<String>,
     pub prefs: RwLock<AgentPrefs>,
+    pub channels: RwLock<crate::notify::Channels>,
     /// Último aviso de "pedindo atenção" por sessão (antispam).
     pub attention_sent: Mutex<std::collections::HashMap<String, Instant>>,
 }
@@ -155,6 +156,7 @@ impl Shared {
             config_path,
             config_warnings,
             prefs: RwLock::new(prefs),
+            channels: RwLock::new(crate::notify::Channels::default()),
             attention_sent: Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -278,6 +280,7 @@ pub fn spawn_usage_indexer(shared: Arc<Shared>) {
                 let agg = idx.scan(30);
                 let j = pulse_agents::usage::to_json(&agg, 30, idx.offset_s());
                 shared.lock().usage_json = Arc::new(j);
+                sys::release_free_memory();
                 std::thread::sleep(Duration::from_secs(300));
             }
         })
@@ -402,6 +405,26 @@ pub fn spawn_collector(shared: Arc<Shared>) {
                 if cfg.notify {
                     for a in &fired {
                         notify(a);
+                    }
+                }
+                if !fired.is_empty() {
+                    let ch = shared
+                        .channels
+                        .read()
+                        .map(|c| c.clone())
+                        .unwrap_or_default();
+                    if ch.alerts && ch.any() {
+                        for a in &fired {
+                            crate::notify::send_async(
+                                ch.clone(),
+                                crate::notify::Message {
+                                    title: format!("Pulse: {}", a.title),
+                                    body: a.detail.clone(),
+                                    severity: a.severity.name().to_string(),
+                                    host: col.host.hostname.clone(),
+                                },
+                            );
+                        }
                     }
                 }
                 let el = started.elapsed();

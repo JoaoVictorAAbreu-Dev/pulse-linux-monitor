@@ -33,6 +33,7 @@ jobs:
           node --check crates/pulse-daemon/src/ui/app.js
           for f in install.sh packaging/pulse-hook packaging/build-deb.sh packaging/deb/pulse-open packaging/deb/postinst packaging/deb/postrm; do sh -n "$f"; done
           bash -n packaging/deb/pulse.bash-completion
+          python3 -m py_compile packaging/pulse-tray
 
   deb:
     name: pacote .deb (${{ matrix.arch }})

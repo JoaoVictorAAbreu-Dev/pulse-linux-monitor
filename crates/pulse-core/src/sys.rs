@@ -31,6 +31,8 @@ extern "C" {
     fn getuid() -> u32;
     fn getpid() -> i32;
     fn gettid() -> i32;
+    fn malloc_trim(pad: usize) -> i32;
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
 const SC_CLK_TCK: i32 = 2;
@@ -110,6 +112,29 @@ pub fn lower_thread_priority(nice: i32) -> Result<(), String> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+/// Ajusta o alocador do glibc para um daemon de longa duração: buffers
+/// grandes (leitura de transcrições) sempre via mmap — devolvidos ao sistema
+/// ao liberar — e no máximo 2 arenas. Sem isso o limiar dinâmico do glibc
+/// cresce e dezenas de MB ficam retidos no heap.
+pub fn tune_allocator() {
+    const M_MMAP_THRESHOLD: i32 = -3;
+    const M_ARENA_MAX: i32 = -8;
+    // SAFETY: mallopt só altera parâmetros do alocador.
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+        mallopt(M_ARENA_MAX, 2);
+    }
+}
+
+/// Devolve ao sistema a memória livre retida pelo alocador (glibc) depois
+/// de trabalhos que leem muitos dados de uma vez (índice de uso, varreduras).
+pub fn release_free_memory() {
+    // SAFETY: malloc_trim só reorganiza o heap; sem ponteiros do chamador.
+    unsafe {
+        malloc_trim(0);
     }
 }
 

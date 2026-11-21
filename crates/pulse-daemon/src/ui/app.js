@@ -238,7 +238,7 @@
         while (lastI > 0 && (s.data[lastI] == null || Number.isNaN(s.data[lastI]))) lastI--;
         paths += `<path d="${d}L${x(lastI).toFixed(1)},${y(0)}L${x(firstI).toFixed(1)},${y(0)}Z" fill="${s.color}" opacity=".16"/>`;
       }
-      paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      paths += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"${s.dash ? ' stroke-dasharray="5 4" opacity=".75"' : ''}/>`;
     }
     const first = ts && ts.length ? ts[0] : null;
     const leftLbl = first && spanLabel === 'auto' ? dateTime(first) : spanLabel;
@@ -281,13 +281,47 @@
   let longRange = store.get('pulse.range') || '15m';
   let longData = null;
   let longTimer = 0;
+  let compare = store.get('pulse.compare') === '1';
+  const SPAN = { '1h': 3600e3, '24h': 86400e3, '7d': 7 * 86400e3 };
+  const PREV = { '1h': 'hora anterior', '24h': 'ontem', '7d': 'semana anterior' };
+  const canCompare = () => compare && SPAN[longRange];
   async function loadLong() {
     if (longRange === '15m') { longData = null; return; }
-    try { longData = await api('/api/history/long?range=' + longRange); } catch (e) { toast('Histórico longo: ' + e.message, true); }
+    // comparar precisa do dobro da janela: 1 h/24 h vêm da camada de 1 min (7 d), 7 d da de 15 min (30 d)
+    const range = canCompare() ? (longRange === '7d' ? '30d' : '7d') : longRange;
+    try { longData = await api('/api/history/long?range=' + range); } catch (e) { toast('Histórico longo: ' + e.message, true); }
+  }
+  /** Reamostra (ts, valores) em `n` baldes iguais entre start e end (média por balde). */
+  function resample(ts, vals, start, end, n) {
+    const sum = new Array(n).fill(0), cnt = new Array(n).fill(0), w = (end - start) / n;
+    for (let i = 0; i < ts.length; i++) {
+      const t = ts[i], v = vals[i];
+      if (t < start || t >= end || v == null || Number.isNaN(v)) continue;
+      const b = Math.min(n - 1, Math.floor((t - start) / w));
+      sum[b] += v; cnt[b]++;
+    }
+    return sum.map((v, i) => (cnt[i] ? v / cnt[i] : null));
   }
   function drawMainChart() {
     const el = $('#ov-chart');
     if (!el) return;
+    if (canCompare() && longData) {
+      const p = longData.points, span = SPAN[longRange], end = Date.now(), n = 120;
+      const now = (k) => resample(p.ts, p[k], end - span, end, n);
+      const before = (k) => resample(p.ts, p[k], end - 2 * span, end - span, n);
+      chart(el, {
+        series: [
+          { data: before('cpu'), color: 'var(--acento)', fill: false, dash: true },
+          { data: before('mem'), color: 'var(--violeta)', fill: false, dash: true },
+          { data: now('cpu'), color: 'var(--acento)' }, { data: now('mem'), color: 'var(--violeta)' },
+        ],
+        max: 100, spanLabel: '−' + longRange.replace('h', ' h').replace('d', ' d'),
+      });
+      const avg = (a) => { const v = a.filter((x) => x != null); return v.length ? v.reduce((x, y) => x + y, 0) / v.length : null; };
+      const c1 = avg(now('cpu')), c0 = avg(before('cpu'));
+      html('ov-chart-note', `tracejado = ${PREV[longRange]} · CPU média ${pct(c1, 0)} agora × ${pct(c0, 0)} antes`);
+      return;
+    }
     if (longRange === '15m' || !longData) {
       chart(el, { series: [{ data: S.hist.cpu, color: 'var(--acento)' }, { data: S.hist.mem, color: 'var(--violeta)' }], ts: S.hist.ts, max: 100 });
     } else {
@@ -296,6 +330,8 @@
     }
     const n = longRange === '15m' ? S.hist.ts.length : longData ? longData.count : 0;
     const bucket = longData && longData.bucket_ms >= 900000 ? '15 min' : '60 s';
+    const cmp = $('#ov-compare-wrap');
+    if (cmp) cmp.hidden = !SPAN[longRange];
     html('ov-chart-note', longRange === '15m' ? `${n} amostras de 1 s` : `${n} médias de ${bucket} (histórico longo)`);
   }
 
@@ -305,7 +341,7 @@
         <div class="grid g3">${kpi('k-cpu', ring(0, 'var(--acento)'))}${kpi('k-mem', ring(0, 'var(--violeta)'))}${kpi('k-swap', ring(0, 'var(--violeta)'))}</div>
         <div class="grid g3">${kpi('k-disk', ring(0, 'var(--acento)'))}${kpi('k-net')}${kpi('k-temp')}</div>
         <div class="grid g-main">
-          ${card('CPU e memória', `<div id="ov-chart"></div><div class="toolbar"><div class="series-legend"><span><i class="dot" style="background:var(--acento)"></i>CPU</span><span><i class="dot" style="background:var(--violeta)"></i>Memória</span></div><span class="sp"></span><span class="muted" id="ov-chart-note"></span></div>`,
+          ${card('CPU e memória', `<div id="ov-chart"></div><div class="toolbar"><div class="series-legend"><span><i class="dot" style="background:var(--acento)"></i>CPU</span><span><i class="dot" style="background:var(--violeta)"></i>Memória</span></div><label class="chk" id="ov-compare-wrap" ${SPAN[longRange] ? '' : 'hidden'}><input type="checkbox" id="ov-compare" ${compare ? 'checked' : ''}> comparar com o período anterior</label><span class="sp"></span><span class="muted" id="ov-chart-note"></span></div>`,
             `<span class="sp"></span><span class="seg" id="ov-range">${['15m', '1h', '24h', '7d', '30d', '90d'].map((r) => `<button data-r="${r}" aria-pressed="${r === longRange}">${r === '15m' ? '15 min' : r.replace('h', ' h').replace('d', ' d')}</button>`).join('')}</span>`)}
           ${card('Alertas', '<div id="ov-alerts"></div>')}
         </div>
@@ -314,6 +350,12 @@
           ${card('Agentes agora', '<div id="ov-agents"><p class="empty">Carregando…</p></div>', '<span class="sp"></span><a class="chip" href="#/agentes">ver agentes</a>')}
         </div>
         ${card('Armazenamento', '<div id="ov-storage"></div>')}`;
+      $('#ov-compare').addEventListener('change', async (e) => {
+        compare = e.target.checked;
+        store.set('pulse.compare', compare ? '1' : '0');
+        await loadLong();
+        drawMainChart();
+      });
       $('#ov-range').addEventListener('click', async (e) => {
         const b = e.target.closest('button');
         if (!b) return;
@@ -1209,11 +1251,74 @@
     try { await api('/api/config/alerts', { method: 'POST', body: ok }); toast('Limiares salvos.'); } catch (e) { toast('Não salvou: ' + e.message, true); }
     loadAlerts();
   }
+  async function loadChannels() {
+    let c;
+    try { c = await api('/api/config/notify'); } catch (e) { html('al-channels', `<p class="empty">Erro: ${esc(e.message)}</p>`); return; }
+    const row = (name, val, extra = '') => `<dt>${esc(name)}</dt><dd>${val ? pill(val, 'ok') + extra : pill('não configurado')}</dd>`;
+    html('al-channels', `<dl class="kv">
+      ${row('ntfy', c.ntfy, c.ntfy_auth ? ' <span class="muted">com token</span>' : '')}
+      ${row(c.webhook_kind === 'discord' ? 'Webhook (Discord)' : 'Webhook (JSON)', c.webhook)}
+      ${row('Telegram', c.telegram ? 'configurado' : '')}
+      <dt>Encaminhar alertas</dt><dd>${c.alerts ? pill('sim', 'ok') : pill('não')}</dd>
+      <dt>Encaminhar "agente pedindo atenção"</dt><dd>${c.agents ? pill('sim', 'ok') : pill('não')}</dd></dl>
+      <p class="muted">Segredos (tokens, URLs completas) ficam só no <code class="cmd">config.toml</code> (0600) e nunca voltam para a tela. O envio usa o <code class="cmd">curl</code>.</p>`);
+    $('#al-ch-test').disabled = !(c.ntfy || c.webhook || c.telegram);
+    S.channels = c;
+  }
+  async function editChannels() {
+    const c = S.channels || {};
+    const f = (id, label, hint, set, type = 'text') => `<label class="field">${esc(label)}<input class="input mono" id="${id}" type="${type}" autocomplete="off" spellcheck="false" placeholder="${set ? '•••• (configurado — deixe em branco para manter)' : esc(hint)}"></label>`;
+    const out = await dialog({
+      title: 'Canais externos de notificação',
+      wide: true,
+      body: `<p class="sub">Envie alertas para o celular ou para um chat. Campos em branco mantêm o valor atual; marque “remover” para apagar um canal.</p>
+        <div class="grid g2" style="gap:4px 16px">
+          ${f('ch-ntfy', 'ntfy: URL do tópico', 'https://ntfy.sh/um-topico-dificil-de-adivinhar', c.ntfy)}
+          ${f('ch-ntfy-token', 'ntfy: token (opcional)', 'tk_…', c.ntfy_auth, 'password')}
+          ${f('ch-webhook', 'Webhook (JSON genérico ou Discord)', 'https://discord.com/api/webhooks/…', c.webhook)}
+          <div></div>
+          ${f('ch-tg-token', 'Telegram: token do bot', '123456:ABC…', c.telegram, 'password')}
+          ${f('ch-tg-chat', 'Telegram: chat id', '123456789', c.telegram)}
+        </div>
+        <div class="toolbar" style="margin:8px 0">
+          <label class="chk"><input type="checkbox" id="ch-rm-ntfy"> remover ntfy</label>
+          <label class="chk"><input type="checkbox" id="ch-rm-webhook"> remover webhook</label>
+          <label class="chk"><input type="checkbox" id="ch-rm-tg"> remover Telegram</label>
+        </div>
+        <label class="chk"><input type="checkbox" id="ch-alerts" ${c.alerts !== false ? 'checked' : ''}> encaminhar alertas do sistema</label><br>
+        <label class="chk"><input type="checkbox" id="ch-agents" ${c.agents ? 'checked' : ''}> encaminhar quando um agente pedir atenção</label>
+        <p class="muted">Tópicos do ntfy.sh são públicos para quem souber o nome: use um nome longo e aleatório ou um servidor com token.</p>`,
+      actions: [{ label: 'Cancelar', value: null }, { label: 'Salvar', cls: 'primary', onclick: () => {
+        const body = { alerts: $('#ch-alerts').checked, agents: $('#ch-agents').checked };
+        const put = (k, id) => { const v = $('#' + id).value.trim(); if (v) body[k] = v; };
+        put('ntfy_url', 'ch-ntfy'); put('ntfy_token', 'ch-ntfy-token'); put('webhook_url', 'ch-webhook');
+        put('telegram_bot_token', 'ch-tg-token'); put('telegram_chat_id', 'ch-tg-chat');
+        if ($('#ch-rm-ntfy').checked) { body.ntfy_url = ''; body.ntfy_token = ''; }
+        if ($('#ch-rm-webhook').checked) body.webhook_url = '';
+        if ($('#ch-rm-tg').checked) { body.telegram_bot_token = ''; body.telegram_chat_id = ''; }
+        closeDialog(body);
+      } }],
+    });
+    if (!out) return;
+    try { await api('/api/config/notify', { method: 'POST', body: out }); toast('Canais salvos.'); } catch (e) { toast('Não salvou: ' + e.message, true); }
+    loadChannels();
+  }
+  async function testChannels() {
+    try {
+      const r = await api('/api/notify/test', { method: 'POST', body: {} });
+      if (!r.results.length) { toast('Nenhum canal configurado.', true); return; }
+      const bad = r.results.filter((x) => !x.ok);
+      toast(bad.length ? 'Falhou: ' + bad.map((x) => `${x.channel} (${x.error})`).join(', ') : `Teste enviado: ${r.results.map((x) => x.channel).join(', ')}`, !!bad.length);
+    } catch (e) { toast('Falhou: ' + e.message, true); }
+  }
   page('alertas', 'Alertas', 'bell', {
     mount(el) {
       el.innerHTML = `${panel('Ativos agora', '<div id="al-active"></div>')}
-        <div class="grid g-main">${card('Histórico', '<div id="al-hist"></div>')}<div class="grid" style="align-content:start">${card('Regras', '<div class="table-wrap" id="al-rules"></div>', '<span class="sp"></span><button class="btn sm" id="al-edit">Editar limiares</button>')}${card('Notificação no desktop', '<div class="toolbar" id="al-notify"></div>')}</div></div>`;
+        <div class="grid g-main">${card('Histórico', '<div id="al-hist"></div>')}<div class="grid" style="align-content:start">${card('Regras', '<div class="table-wrap" id="al-rules"></div>', '<span class="sp"></span><button class="btn sm" id="al-edit">Editar limiares</button>')}${card('Notificação no desktop', '<div class="toolbar" id="al-notify"></div>')}${card('Canais externos', '<div id="al-channels"><p class="empty">Carregando…</p></div>', '<span class="sp"></span><button class="btn sm" id="al-ch-test">Enviar teste</button><button class="btn sm" id="al-ch-edit">Configurar</button>')}</div></div>`;
       $('#al-edit').addEventListener('click', editRules);
+      $('#al-ch-edit').addEventListener('click', editChannels);
+      $('#al-ch-test').addEventListener('click', testChannels);
+      loadChannels();
       loadAlerts();
     },
     unmount() { clearTimeout(alertsTimer); },
@@ -1252,6 +1357,48 @@
     window.scrollTo(0, 0);
   }
   window.addEventListener('hashchange', route);
+
+  // Atalhos: g + letra navega, / busca, t tema, ? ajuda.
+  const GO = { v: 'visao-geral', c: 'cpu', m: 'memoria', d: 'discos', p: 'processos', s: 'servicos', r: 'rede', l: 'logs', a: 'agentes', x: 'alertas' };
+  let gPending = 0;
+  function shortcutsHelp() {
+    const row = (k, d) => `<dt><code class="cmd">${esc(k)}</code></dt><dd style="text-align:left;font-weight:500">${esc(d)}</dd>`;
+    dialog({
+      title: 'Atalhos de teclado',
+      body: `<dl class="kv" style="grid-template-columns:auto 1fr">${Object.entries(GO).map(([k, id]) => row('g ' + k, PAGES.find((x) => x.id === id).title)).join('')}
+        ${row('/', 'buscar/filtrar na tela atual')}${row('t', 'alternar tema (auto → claro → escuro)')}${row('?', 'esta ajuda')}${row('Esc', 'fechar diálogos')}</dl>`,
+      actions: [{ label: 'Fechar', cls: 'primary', value: true }],
+    });
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (!$('#overlay').hidden) return;
+    const k = e.key;
+    if (gPending && Date.now() - gPending < 1500 && GO[k]) {
+      gPending = 0;
+      e.preventDefault();
+      location.hash = '#/' + GO[k];
+      return;
+    }
+    gPending = 0;
+    if (k === 'g') { gPending = Date.now(); return; }
+    if (k === '/') {
+      const f = $('#page input[type="search"], #page input.input:not([type="checkbox"])');
+      if (f) { e.preventDefault(); f.focus(); f.select && f.select(); }
+      return;
+    }
+    if (k === '?') { e.preventDefault(); shortcutsHelp(); return; }
+    if (k === 't') {
+      const order = ['auto', 'light', 'dark'];
+      const cur = store.get('pulse.theme') || 'auto';
+      const next = order[(order.indexOf(cur) + 1) % order.length];
+      store.set('pulse.theme', next);
+      applyTheme(next);
+      toast(`Tema: ${{ auto: 'automático', light: 'claro', dark: 'escuro' }[next]}`);
+    }
+  });
   let resizeT = 0;
   window.addEventListener('resize', () => { clearTimeout(resizeT); resizeT = setTimeout(() => { if (S.snap && S.page && S.page.update) S.page.update(S.snap); }, 150); });
 
@@ -1293,6 +1440,10 @@
   } catch { /* fallback de blur */ }
 
   // ------------------------------------------------------------ início
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    navigator.serviceWorker.register('/sw.js').catch(() => { /* instalação como app é opcional */ });
+  }
+
   async function boot() {
     renderNav();
     const m = location.hash.match(/^#token=([0-9a-fA-F]{32,})/);

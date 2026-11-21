@@ -1,0 +1,24 @@
+.TH PULSE-TRAY 1 "2026-11-21" "pulse-monitor 0.4.0" "Comandos do usuário"
+.SH NOME
+pulse-tray \- ícone do Pulse na bandeja do sistema
+.SH SINOPSE
+.B pulse-tray
+[\fB\-\-port\fR \fIN\fR] [\fB\-\-install\-autostart\fR | \fB\-\-remove\-autostart\fR]
+.SH DESCRIÇÃO
+Mostra CPU e memória no rótulo do ícone, os alertas ativos e o estado dos
+agentes de IA no menu, e abre o painel com um clique. Fala o protocolo
+StatusNotifierItem e dbusmenu diretamente pelo D-Bus (python3-gi/Gio), sem
+GTK. No GNOME, requer a extensão de AppIndicators (padrão no Ubuntu).
+.SH OPÇÕES
+.TP
+.BR \-\-port " " \fIN\fR
+Porta do daemon (padrão 7878; também via \fBPULSE_PORT\fR).
+.TP
+.B \-\-install\-autostart
+Inicia o ícone junto com a sessão (~/.config/autostart/pulse-tray.desktop).
+.TP
+.B \-\-remove\-autostart
+Remove o início automático.
+.SH VEJA TAMBÉM
+.BR pulse (1),
+.BR pulse-open (1)

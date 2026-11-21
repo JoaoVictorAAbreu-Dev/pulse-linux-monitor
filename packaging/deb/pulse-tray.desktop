@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Pulse (bandeja)
+GenericName=Monitor do sistema na bandeja
+Comment=Ícone do Pulse na bandeja com CPU, memória, alertas e agentes
+Exec=pulse-tray
+Icon=pulse-monitor
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=false

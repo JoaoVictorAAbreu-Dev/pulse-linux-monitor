@@ -27,6 +27,31 @@ pub struct FileConfig {
     pub show_tool_details: Option<bool>,
     /// [prices] modelo = "entrada, saída, leitura de cache, escrita de cache" (US$/milhão de tokens).
     pub prices: BTreeMap<String, [f64; 4]>,
+    /// [notify] canais externos (ntfy, webhook, Telegram).
+    pub channels: crate::notify::Channels,
+    pub notify_alerts: Option<bool>,
+    pub notify_agents: Option<bool>,
+}
+
+pub fn valid_telegram_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 100
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || ":_-".contains(c))
+}
+
+pub fn valid_chat_id(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 64
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_@".contains(c))
+}
+
+pub fn valid_ntfy_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 200
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
 }
 
 /// Lê "3, 15, 0.3, 3.75" ou [3, 15, 0.3, 3.75].
@@ -157,6 +182,40 @@ pub fn parse(src: &str) -> (FileConfig, Vec<String>) {
                     n + 1,
                     model
                 )),
+            },
+            ("notify", "ntfy_url") | ("notify", "webhook_url") => {
+                if crate::notify::valid_url(v) {
+                    if k == "ntfy_url" {
+                        c.channels.ntfy_url = Some(v.to_string())
+                    } else {
+                        c.channels.webhook_url = Some(v.to_string())
+                    }
+                } else {
+                    warn.push(format!("linha {}: URL inválida em {} (use http:// ou https://)", n + 1, k))
+                }
+            }
+            ("notify", "ntfy_token") => match valid_ntfy_token(v) {
+                true => c.channels.ntfy_token = Some(v.to_string()),
+                false => bad(&mut warn),
+            },
+            ("notify", "telegram_bot_token") => match valid_telegram_token(v) {
+                true => c.channels.telegram_bot_token = Some(v.to_string()),
+                false => bad(&mut warn),
+            },
+            ("notify", "telegram_chat_id") => match valid_chat_id(v) {
+                true => c.channels.telegram_chat_id = Some(v.to_string()),
+                false => bad(&mut warn),
+            },
+            ("notify", "alerts") | ("notify", "agents") => match v {
+                "true" | "false" => {
+                    let b = Some(v == "true");
+                    if k == "alerts" {
+                        c.notify_alerts = b
+                    } else {
+                        c.notify_agents = b
+                    }
+                }
+                _ => bad(&mut warn),
             },
             ("alerts", key) if ALERT_KEYS.contains(&key) => match v.parse::<f64>() {
                 Ok(x) if x.is_finite() => {
@@ -437,6 +496,16 @@ pub const EXAMPLE: &str = "# ~/.config/pulse/config.toml — configuração do P
 # Um modelo casa pelo nome exato ou pelo prefixo mais longo.
 # \"claude-opus-5-5\" = \"0, 0, 0, 0\"
 
+[notify]
+# Canais externos para alertas (e, opcionalmente, agentes pedindo atenção).
+# ntfy_url = \"https://ntfy.sh/um-topico-dificil-de-adivinhar\"
+# ntfy_token = \"tk_...\"               # só para servidores ntfy com autenticação
+# webhook_url = \"https://exemplo.com/webhook\"   # JSON genérico ou webhook do Discord
+# telegram_bot_token = \"123456:ABC...\"
+# telegram_chat_id = \"123456789\"
+# alerts = true                 # encaminhar alertas do sistema
+# agents = false                # encaminhar \"agente pedindo atenção\"
+
 [alerts]
 # cpu_pct = 90                # CPU acima disso…
 # cpu_samples = 30            # …por N amostras seguidas
@@ -517,6 +586,18 @@ mod tests {
         assert_eq!(c.prices["ollama/qwen3:4b"], [0.0; 4]);
         assert_eq!(w.len(), 2, "{:?}", w);
         assert_eq!(parse_price("-1,0,0,0"), None);
+    }
+
+    #[test]
+    fn notify_section() {
+        let (c, w) = parse(
+            "[notify]\nntfy_url = \"https://ntfy.sh/t\"\nwebhook_url = \"ftp://x\"\ntelegram_bot_token = \"123:AB-c_d\"\ntelegram_chat_id = \"-100123\"\nagents = true\nntfy_token = \"tem espaço\"\n",
+        );
+        assert_eq!(c.channels.ntfy_url.as_deref(), Some("https://ntfy.sh/t"));
+        assert_eq!(c.channels.webhook_url, None);
+        assert_eq!(c.channels.telegram_chat_id.as_deref(), Some("-100123"));
+        assert_eq!(c.notify_agents, Some(true));
+        assert_eq!(w.len(), 2, "{:?}", w);
     }
 
     #[test]
