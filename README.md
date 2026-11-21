@@ -25,7 +25,7 @@ Baixe o `.deb` da página de Releases do GitHub (amd64 e arm64) ou gere localmen
 ```sh
 packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
 packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
-sudo apt install ./target/deb/pulse-monitor_0.1.0_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.2.0_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 ```
 
