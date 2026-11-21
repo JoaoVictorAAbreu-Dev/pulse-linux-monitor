@@ -1,0 +1,44 @@
+#!/bin/sh
+# pulse-hook — envia o estado de um agente de IA ao Pulse.
+#
+# Uso:  pulse-hook <estado> [agente] [json]
+#   o JSON do evento chega pela entrada padrão (Claude Code) ou como 3º argumento (Codex notify)
+#   estado: executando | atencao | aguardando | concluido
+#   agente: claude (padrão), codex, openclaw, ponto...
+#
+# Nunca bloqueia nem falha o agente: tempo limite curto e saída sempre 0.
+# O token vai para o curl por um arquivo de configuração na entrada padrão,
+# não pela linha de comando (que outros usuários podem ler em /proc).
+
+state="${1:-}"
+agent="${2:-claude}"
+port="${PULSE_PORT:-7878}"
+token_file="${XDG_CONFIG_HOME:-$HOME/.config}/pulse/token"
+
+umask 077
+tmp=$(mktemp "${TMPDIR:-/tmp}/pulse-hook.XXXXXX") || exit 0
+trap 'rm -f "$tmp"' EXIT INT TERM
+
+# O notify do Codex passa o JSON do evento como 3º argumento; os hooks do
+# Claude Code o enviam pela entrada padrão.
+if [ -n "${3:-}" ]; then
+  printf '%s' "$3" | head -c 1048576 > "$tmp"
+elif [ -t 0 ]; then
+  : > "$tmp"
+else
+  head -c 1048576 > "$tmp"
+fi
+
+[ -n "$state" ] || exit 0
+[ -r "$token_file" ] || exit 0
+command -v curl >/dev/null 2>&1 || exit 0
+token=$(head -c 256 "$token_file" | tr -dc '0-9a-fA-F')
+
+printf 'header = "X-Pulse-Token: %s"\n' "$token" | curl -s -m 2 -o /dev/null -K - \
+  -X POST \
+  -H "X-Pulse-State: $state" \
+  -H "X-Pulse-Agent: $agent" \
+  -H 'Content-Type: application/json' \
+  --data-binary @"$tmp" \
+  "http://127.0.0.1:${port}/api/agents/hook" 2>/dev/null
+exit 0

@@ -1,0 +1,10 @@
+# ~/.config/pulse/agents.conf — regras extras de detecção de agentes.
+# Formato:  Nome exibido = padrão1, padrão2, ...
+#   padrão simples  → casa com o nome do processo (comm) ou com o nome-base de argv[0]
+#   cmd:texto       → casa se "texto" aparece na linha de comando completa
+# Regras deste arquivo têm prioridade sobre as embutidas
+# (Claude Code, Codex e OpenClaw/"Ponto").
+
+# Aider = aider, cmd:aider-chat
+# Gemini CLI = gemini, cmd:@google/gemini-cli
+# Ponto = cmd:ponto-agent

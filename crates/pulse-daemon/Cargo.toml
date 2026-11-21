@@ -1,0 +1,14 @@
+[package]
+name = "pulse-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Daemon HTTP do Pulse: coletor, API, SSE e UI embutida"
+
+[[bin]]
+name = "pulse"
+path = "src/main.rs"
+
+[dependencies]
+pulse-core = { path = "../pulse-core" }
+pulse-agents = { path = "../pulse-agents" }

@@ -1,0 +1,8 @@
+[package]
+name = "pulse-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coletores de métricas do Linux (/proc, /sys) e lógica do Pulse"
+
+[dependencies]
