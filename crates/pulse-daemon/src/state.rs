@@ -23,6 +23,8 @@ pub struct State {
     pub snapshot: Arc<String>,
     pub ring: Ring,
     pub long: LongStore,
+    /// Camada de 15 min com retenção de 90 dias.
+    pub long90: LongStore,
     pub alerts: Engine,
     pub procs: Arc<Vec<Proc>>,
     pub agents_json: Arc<String>,
@@ -42,12 +44,22 @@ pub struct Shared {
     token: RwLock<String>,
     token_mtime: Mutex<Option<std::time::SystemTime>>,
     pub fails: FailTracker,
+    pub cgroups: Mutex<pulse_core::cgroups::CgroupSampler>,
+    pub du_jobs: Mutex<std::collections::HashMap<String, DuJob>>,
     pub allowed_hosts: Vec<String>,
     pub config_path: PathBuf,
     pub config_warnings: Vec<String>,
 }
 
 pub const EVENT_CAP: usize = 300;
+
+/// Varredura de espaço em segundo plano.
+pub struct DuJob {
+    pub started: Instant,
+    pub progress: Arc<std::sync::atomic::AtomicU64>,
+    /// (quando terminou, JSON do resultado ou erro)
+    pub result: Option<(Instant, Result<String, String>)>,
+}
 
 impl Shared {
     pub fn new(
@@ -66,6 +78,14 @@ impl Shared {
             days * 86_400_000,
             sys::now_ms(),
         );
+        let mut long90 = LongStore::open_tier(
+            dir.join("history-15m.log"),
+            15 * BUCKET_MS,
+            (90 * 86_400_000 / (15 * BUCKET_MS)) as usize,
+            90 * 86_400_000,
+            sys::now_ms(),
+        );
+        long90.backfill_from(&long);
         let mut alerts = Engine::new(rules);
         let alert_log = EventLog::open(dir.join("alerts.log"), EVENT_CAP, |l| {
             alerts::Event::from_json(l).is_some()
@@ -82,6 +102,7 @@ impl Shared {
                 snapshot: Arc::new("{}".into()),
                 ring: Ring::new(HISTORY_CAP),
                 long,
+                long90,
                 alerts,
                 procs: Arc::new(Vec::new()),
                 agents_json: Arc::new("[]".into()),
@@ -97,6 +118,8 @@ impl Shared {
             token_mtime: Mutex::new(token_mtime()),
             token: RwLock::new(token),
             fails: FailTracker::default(),
+            cgroups: Mutex::new(pulse_core::cgroups::CgroupSampler::default()),
+            du_jobs: Mutex::new(std::collections::HashMap::new()),
             allowed_hosts,
             config_path,
             config_warnings,
@@ -299,6 +322,7 @@ pub fn spawn_collector(shared: Arc<Shared>) {
                 st.snapshot = Arc::new(snap);
                 st.ring.push(t.point);
                 st.long.add(t.point);
+                st.long90.add(t.point);
                 st.procs = Arc::new(t.procs);
                 drop(st);
                 shared.tick.notify_all();

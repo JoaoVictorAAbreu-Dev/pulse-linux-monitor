@@ -182,12 +182,23 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
                 "6h" => 6 * 3_600_000,
                 "24h" => 24 * 3_600_000,
                 "7d" => 7 * 24 * 3_600_000,
+                "30d" => 30 * 24 * 3_600_000,
+                "90d" => 90 * 24 * 3_600_000,
                 _ => {
-                    return Outcome::Resp(Response::error(400, "range deve ser 1h, 6h, 24h ou 7d"))
+                    return Outcome::Resp(Response::error(
+                        400,
+                        "range deve ser 1h, 6h, 24h, 7d, 30d ou 90d",
+                    ))
                 }
             };
             let since = sys::now_ms().saturating_sub(range_ms);
-            Response::ok_json(sh.lock().long.to_json(since))
+            let st = sh.lock();
+            // até 7 dias: médias de 1 min; acima: camada de 15 min (90 dias)
+            Response::ok_json(if range_ms > 7 * 24 * 3_600_000 {
+                st.long90.to_json(since)
+            } else {
+                st.long.to_json(since)
+            })
         }
         ("GET", "/api/processes") => {
             let list = sh.lock().procs.clone();
@@ -357,11 +368,34 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
                 Err(e) => Response::error(400, &e),
             }
         }
-        ("GET", "/api/disk/usage") => {
-            let home = sys::home().to_string_lossy().into_owned();
-            let path = req.q("path").unwrap_or(&home);
-            match disk::du(path, 400_000, 4_000) {
-                Ok(r) => Response::ok_json(r.to_json()),
+        ("GET", "/api/disk/usage") => du_route(sh, req),
+        ("GET", "/api/disk/smart") => {
+            let devs: Vec<String> = disk::read_devices().into_iter().map(|d| d.0).collect();
+            Response::ok_json(pulse_core::smart::smart_json(&devs))
+        }
+        ("GET", "/api/cgroups") => {
+            let mut cg = sh.cgroups.lock().unwrap_or_else(|e| e.into_inner());
+            if !cg.available() {
+                Response::ok_json("{\"available\":false,\"units\":[]}")
+            } else {
+                let u = cg.sample();
+                Response::ok_json(
+                    Obj::new()
+                        .b("available", true)
+                        .raw("units", &pulse_core::cgroups::usage_json(&u))
+                        .finish(),
+                )
+            }
+        }
+        ("GET", "/api/containers/logs") => {
+            let id = req.q("id").unwrap_or("");
+            let lines = req
+                .q("lines")
+                .and_then(|x| x.parse::<u32>().ok())
+                .unwrap_or(200)
+                .clamp(10, 2000);
+            match schedule::container_logs(id, lines) {
+                Ok(t) => Response::ok_json(Obj::new().s("id", id).s("text", &t).finish()),
                 Err(e) => Response::error(400, &e),
             }
         }
@@ -410,6 +444,85 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         _ => Response::error(404, "rota não encontrada"),
     };
     Outcome::Resp(r)
+}
+
+/// Explorador de espaço: varredura em thread própria com cache de 5 min.
+/// Responde na hora com o resultado em cache ou com `pending` + progresso.
+fn du_route(sh: &Arc<Shared>, req: &Request) -> Response {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let home = sys::home().to_string_lossy().into_owned();
+    let raw = req.q("path").filter(|p| !p.is_empty()).unwrap_or(&home);
+    let key = match std::path::Path::new(raw).canonicalize() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => return Response::error(400, &e.to_string()),
+    };
+    let refresh = req.q("refresh") == Some("1");
+    let mut jobs = sh.du_jobs.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(j) = jobs.get(&key) {
+        match &j.result {
+            Some((at, res)) if !refresh && at.elapsed().as_secs() < 300 => {
+                return match res {
+                    Ok(json) => Response::ok_json(format!(
+                        "{},\"cached_s\":{}}}",
+                        &json[..json.len() - 1],
+                        at.elapsed().as_secs()
+                    )),
+                    Err(e) => Response::error(400, e),
+                };
+            }
+            None => {
+                return Response::ok_json(
+                    Obj::new()
+                        .b("pending", true)
+                        .s("path", &key)
+                        .u("scanned", j.progress.load(Ordering::Relaxed))
+                        .n("elapsed_s", j.started.elapsed().as_secs_f64())
+                        .finish(),
+                );
+            }
+            _ => {}
+        }
+    }
+    // limpa resultados antigos e limita a quantidade de varreduras guardadas
+    jobs.retain(|_, j| {
+        j.result
+            .as_ref()
+            .map(|(at, _)| at.elapsed().as_secs() < 600)
+            .unwrap_or(true)
+    });
+    if jobs.values().filter(|j| j.result.is_none()).count() >= 3 {
+        return Response::error(429, "já há varreduras demais em andamento; aguarde");
+    }
+    let progress = Arc::new(AtomicU64::new(0));
+    jobs.insert(
+        key.clone(),
+        crate::state::DuJob {
+            started: std::time::Instant::now(),
+            progress: progress.clone(),
+            result: None,
+        },
+    );
+    drop(jobs);
+    let sh2 = sh.clone();
+    let k2 = key.clone();
+    std::thread::spawn(move || {
+        // varredura pesada: não deve competir com o resto da máquina
+        let _ = sys::lower_thread_priority(10);
+        let res =
+            disk::du_with_progress(&k2, 5_000_000, 180_000, Some(&progress)).map(|r| r.to_json());
+        let mut jobs = sh2.du_jobs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(j) = jobs.get_mut(&k2) {
+            j.result = Some((std::time::Instant::now(), res));
+        }
+    });
+    Response::ok_json(
+        Obj::new()
+            .b("pending", true)
+            .s("path", &key)
+            .u("scanned", 0)
+            .n("elapsed_s", 0.0)
+            .finish(),
+    )
 }
 
 /// Caminho do script de hook: ao lado do binário ou em ~/.local/bin.

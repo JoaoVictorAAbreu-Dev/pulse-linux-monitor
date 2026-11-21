@@ -23,6 +23,10 @@ pub struct Collector {
     ticks: u64,
     listening: String,
     tcp_states: String,
+    gpus: crate::gpu::GpuReader,
+    gpu_json: String,
+    power: crate::power::PowerReader,
+    power_json: String,
 }
 
 pub struct Tick {
@@ -62,6 +66,10 @@ impl Collector {
             ticks: 0,
             listening: "[]".into(),
             tcp_states: "{}".into(),
+            gpus: crate::gpu::GpuReader::new(),
+            gpu_json: "[]".into(),
+            power: crate::power::PowerReader::new(),
+            power_json: "null".into(),
         }
     }
 
@@ -203,6 +211,18 @@ impl Collector {
             .raw("listening", &self.listening)
             .finish();
 
+        // GPU (a cada amostra; nvidia-smi é caro, então a cada 5)
+        if !self.gpus.is_empty() && (self.ticks.is_multiple_of(5) || !self.gpus_has_nvidia()) {
+            self.gpu_json = crate::gpu::list_json(&self.gpus.sample());
+        }
+        // Energia: bateria e RAPL a cada 5 amostras (variam devagar)
+        if self.ticks.is_multiple_of(5) {
+            let (bats, ac) = crate::power::PowerReader::batteries();
+            let cpu_w = self.power.cpu_watts();
+            self.power_json =
+                crate::power::power_json(&bats, ac, cpu_w, self.power.rapl_note.as_deref());
+        }
+
         // Temperaturas
         let temps = sensors::temps();
         let tmax = sensors::max_temp(&temps);
@@ -221,6 +241,7 @@ impl Collector {
             .raw("summary", &procs::summary_json(&summary))
             .raw("top", &procs::list_json(&top))
             .raw("top_mem", &procs::list_json(&procs::top_mem(&plist, 8)))
+            .raw("top_swap", &procs::list_json(&procs::top_swap(&plist, 10)))
             .finish();
 
         let point = Point {
@@ -252,10 +273,18 @@ impl Collector {
                 ("net", net_json),
                 ("temps", sensors::temps_json(&temps)),
                 ("procs", procs_json),
+                ("gpus", self.gpu_json.clone()),
+                ("power", self.power_json.clone()),
             ],
             temps,
             procs: plist,
         }
+    }
+}
+
+impl Collector {
+    fn gpus_has_nvidia(&self) -> bool {
+        self.gpu_json.contains("\"NVIDIA\"")
     }
 }
 

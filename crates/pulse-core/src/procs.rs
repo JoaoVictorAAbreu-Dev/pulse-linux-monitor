@@ -20,6 +20,11 @@ pub struct Proc {
     pub nice: i64,
     pub start_ticks: u64,
     pub ticks: u64,
+    /// Leitura/escrita em disco (B/s); None sem permissão para /proc/<pid>/io.
+    pub io_rd: Option<f64>,
+    pub io_wr: Option<f64>,
+    /// Memória do processo que está na swap (bytes).
+    pub swap: u64,
 }
 
 impl Proc {
@@ -35,6 +40,9 @@ impl Proc {
             .u("rss", self.rss)
             .u("threads", self.threads)
             .i("nice", self.nice)
+            .opt_n("io_rd", self.io_rd)
+            .opt_n("io_wr", self.io_wr)
+            .u("swap", self.swap)
             .finish()
     }
 }
@@ -107,13 +115,45 @@ pub fn start_ticks(pid: i32) -> Option<u64> {
     parse_pid_stat(&sys::read(&format!("/proc/{}/stat", pid))?).map(|s| s.start_ticks)
 }
 
+/// `read_bytes`/`write_bytes` de /proc/<pid>/io (E/S real no disco).
+pub fn parse_io(src: &str) -> Option<(u64, u64)> {
+    let mut r = None;
+    let mut w = None;
+    for l in src.lines() {
+        if let Some(v) = l.strip_prefix("read_bytes:") {
+            r = v.trim().parse().ok();
+        } else if let Some(v) = l.strip_prefix("write_bytes:") {
+            w = v.trim().parse().ok();
+        }
+    }
+    Some((r?, w?))
+}
+
+/// `VmSwap` de /proc/<pid>/status, em bytes.
+pub fn parse_vmswap(status: &str) -> u64 {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("VmSwap:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(0)
+}
+
+/// Estado anterior de um PID: (ticks, início, E/S lida, E/S escrita).
+type Prev = (u64, u64, Option<(u64, u64)>);
+
 pub struct Sampler {
-    prev: HashMap<i32, (u64, u64)>,
+    prev: HashMap<i32, Prev>,
     prev_at: std::time::Instant,
     users: HashMap<u32, String>,
     users_at: std::time::Instant,
     clk: f64,
     page: u64,
+    /// cmdline e VmSwap em cache por (pid, início): evitam reler arquivos
+    /// que quase nunca mudam a cada amostra.
+    cmd_cache: HashMap<i32, (u64, String)>,
+    swap_cache: HashMap<i32, (u64, u64)>,
+    samples: u64,
 }
 
 impl Default for Sampler {
@@ -131,6 +171,9 @@ impl Sampler {
             users_at: std::time::Instant::now(),
             clk: sys::clock_ticks(),
             page: sys::page_size(),
+            cmd_cache: HashMap::new(),
+            swap_cache: HashMap::new(),
+            samples: 0,
         }
     }
 
@@ -141,6 +184,7 @@ impl Sampler {
             self.users = sys::users();
             self.users_at = now;
         }
+        let refresh_swap = self.samples.is_multiple_of(5);
         let mut out = Vec::new();
         let mut next = HashMap::new();
         let Ok(rd) = std::fs::read_dir("/proc") else {
@@ -156,14 +200,49 @@ impl Sampler {
                 continue;
             };
             let uid = e.metadata().map(|m| m.uid()).unwrap_or(0);
-            let cpu = match self.prev.get(&pid) {
-                Some((t, start)) if *start == st.start_ticks => {
-                    (st.ticks.saturating_sub(*t) as f64 / self.clk) / dt * 100.0
-                }
-                _ => 0.0,
+            let io = sys::read(&format!("/proc/{}/io", pid)).and_then(|s| parse_io(&s));
+            let same = self.prev.get(&pid).filter(|p| p.1 == st.start_ticks);
+            let cpu = match same {
+                Some((t, _, _)) => (st.ticks.saturating_sub(*t) as f64 / self.clk) / dt * 100.0,
+                None => 0.0,
             };
-            next.insert(pid, (st.ticks, st.start_ticks));
-            let cmd = cmdline(pid);
+            let (io_rd, io_wr) = match (io, same.and_then(|p| p.2)) {
+                (Some((r, w)), Some((pr, pw))) => (
+                    Some(r.saturating_sub(pr) as f64 / dt),
+                    Some(w.saturating_sub(pw) as f64 / dt),
+                ),
+                (Some(_), None) => (Some(0.0), Some(0.0)),
+                _ => (None, None),
+            };
+            // VmSwap só existe para processos de usuário (não threads do kernel).
+            // Relida a cada 5 amostras (muda devagar).
+            let swap = if st.rss_pages == 0 {
+                0
+            } else {
+                match self.swap_cache.get(&pid) {
+                    Some((start, v)) if *start == st.start_ticks && !refresh_swap => *v,
+                    _ => {
+                        let v = sys::read(&format!("/proc/{}/status", pid))
+                            .map(|s| parse_vmswap(&s))
+                            .unwrap_or(0);
+                        self.swap_cache.insert(pid, (st.start_ticks, v));
+                        v
+                    }
+                }
+            };
+            next.insert(pid, (st.ticks, st.start_ticks, io));
+            let cmd = match self.cmd_cache.get(&pid) {
+                Some((start, c))
+                    if *start == st.start_ticks && (!c.is_empty() || st.rss_pages == 0) =>
+                {
+                    c.clone()
+                }
+                _ => {
+                    let c = cmdline(pid);
+                    self.cmd_cache.insert(pid, (st.start_ticks, c.clone()));
+                    c
+                }
+            };
             out.push(Proc {
                 pid,
                 ppid: st.ppid,
@@ -186,9 +265,15 @@ impl Sampler {
                 nice: st.nice,
                 start_ticks: st.start_ticks,
                 ticks: st.ticks,
+                io_rd,
+                io_wr,
+                swap,
             });
         }
+        self.cmd_cache.retain(|pid, _| next.contains_key(pid));
+        self.swap_cache.retain(|pid, _| next.contains_key(pid));
         self.prev = next;
+        self.samples += 1;
         self.prev_at = now;
         out
     }
@@ -250,6 +335,14 @@ pub fn top(list: &[Proc], n: usize) -> Vec<Proc> {
     v
 }
 
+/// Processos com mais memória na swap.
+pub fn top_swap(list: &[Proc], n: usize) -> Vec<Proc> {
+    let mut v: Vec<Proc> = list.iter().filter(|p| p.swap > 0).cloned().collect();
+    v.sort_by_key(|p| std::cmp::Reverse(p.swap));
+    v.truncate(n);
+    v
+}
+
 pub fn top_mem(list: &[Proc], n: usize) -> Vec<Proc> {
     let mut v: Vec<Proc> = list.to_vec();
     v.sort_by_key(|p| std::cmp::Reverse(p.rss));
@@ -273,6 +366,28 @@ mod tests {
         assert_eq!(f.threads, 7);
         assert_eq!(f.start_ticks, 99999);
         assert_eq!(f.rss_pages, 300);
+    }
+
+    #[test]
+    fn io_and_swap_parsing() {
+        let io = "rchar: 10\nwchar: 5\nsyscr: 1\nread_bytes: 4096\nwrite_bytes: 8192\ncancelled_write_bytes: 0\n";
+        assert_eq!(parse_io(io), Some((4096, 8192)));
+        assert_eq!(parse_io("rchar: 1\n"), None);
+        assert_eq!(parse_vmswap("Name:\tx\nVmSwap:\t     128 kB\n"), 128 * 1024);
+        assert_eq!(parse_vmswap("Name:\tkthread\n"), 0);
+    }
+
+    #[test]
+    fn sampler_measures_own_io() {
+        let mut s = Sampler::new();
+        s.sample();
+        let me = sys::self_pid();
+        let list = s.sample();
+        let p = list.iter().find(|p| p.pid == me).unwrap();
+        assert!(
+            p.io_rd.is_some(),
+            "o próprio processo tem /proc/self/io legível"
+        );
     }
 
     #[test]

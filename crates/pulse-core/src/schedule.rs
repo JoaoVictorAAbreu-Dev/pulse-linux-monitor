@@ -393,6 +393,38 @@ pub fn container_action(verb: &str, id: &str) -> Result<String, String> {
     }
 }
 
+/// Últimas linhas de log de um contêiner (stdout + stderr, com horário).
+pub fn container_logs(id: &str, lines: u32) -> Result<String, String> {
+    if !valid_container(id) {
+        return Err("identificador de contêiner inválido".into());
+    }
+    let n = lines.clamp(10, 2000).to_string();
+    let (ok, out, err) = sys::run_cmd(
+        "docker",
+        &["logs", "--tail", &n, "--timestamps", "--", id],
+        15_000,
+    )?;
+    if !ok && out.is_empty() {
+        return Err(err
+            .lines()
+            .next()
+            .unwrap_or("docker logs falhou")
+            .to_string());
+    }
+    // docker logs escreve o stderr do contêiner no stderr: junta os dois
+    let mut all: Vec<&str> = out.lines().chain(err.lines()).collect();
+    all.sort(); // linhas começam com o horário RFC 3339
+    let mut text = all.join("\n");
+    if text.len() > 1_000_000 {
+        let cut = text.len() - 1_000_000;
+        let cut = (cut..text.len())
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(cut);
+        text = text[cut..].to_string();
+    }
+    Ok(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +478,6 @@ mod tests {
         assert!(!valid_container("--rm"));
         assert!(!valid_container("a;b"));
         assert!(container_action("rm", "db").is_err());
+        assert!(container_logs("--help", 10).is_err());
     }
 }

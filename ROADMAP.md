@@ -28,6 +28,13 @@ O workflow de CI ainda precisa rodar no GitHub para ser considerado validado lá
 
 ## Fase 2 — Monitoramento mais profundo
 
+**Status (21/11/2026):** 2.1–2.10 implementados e validados localmente (clippy `-D warnings`, 96 testes,
+capturas das telas sem transbordos). Validado com dados reais desta máquina: GPU AMD (uso, VRAM, GTT,
+temperatura, frequência), E/S de 161 processos, 99 unidades de cgroup (7 contêineres), swap por processo,
+logs de contêiner, `du` assíncrono e camada de 15 min. **Não validado com hardware real:** SMART (sem
+smartmontools), bateria (desktop), RAPL (restrito ao root) e NVIDIA. Custo medido: ≈ 3,8–4,2% de CPU,
+contra 3,5–3,6% da v0.1.0, graças ao cache de cmdline/VmSwap.
+
 | # | Item | Esforço | Por quê / o quê |
 |---|---|---|---|
 | 2.1 | **GPU** | P | Esta máquina expõe `gpu_busy_percent` e `mem_info_vram_*` (amdgpu) em `/sys/class/drm`. Novo cartão em CPU/Visão geral com uso, VRAM e temperatura (o sensor `amdgpu` já é lido). NVIDIA via `nvidia-smi` se existir. |

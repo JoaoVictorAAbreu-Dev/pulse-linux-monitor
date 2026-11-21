@@ -85,21 +85,28 @@ Linhas inválidas viram avisos (no log do serviço e em `GET /api/config`) e nã
 ## Telas
 
 1. **Visão geral** — KPIs (CPU, memória, swap, disco, rede ↓/↑, temperatura), gráfico CPU/memória
-   (15 min ao vivo ou 1 h / 24 h / 7 d do histórico longo), alertas, maiores consumidores,
+   (15 min ao vivo ou 1 h / 24 h / 7 d em médias de 1 min, 30 d / 90 d em médias de 15 min), alertas, maiores consumidores,
    agentes agora e armazenamento.
 2. **CPU** — histórico, usuário/sistema/iowait, carga 1/5/15, trocas de contexto, PSI, governor,
-   núcleos com frequência e sensores de temperatura.
+   núcleos com frequência e sensores de temperatura; **GPU** (uso, VRAM/GTT, frequência, temperatura e
+   potência via amdgpu/i915 no `/sys/class/drm`, ou `nvidia-smi`); **energia** (baterias com saúde e
+   tempo restante; consumo da CPU via RAPL quando legível).
 3. **Memória** — composição (apps/cache/livre), swap, shmem, páginas sujas, swappiness, mortes por OOM,
-   PSI, histórico e maiores consumidores.
+   PSI, histórico, maiores consumidores e **quem está na swap** (`VmSwap` por processo).
 4. **Discos** — sistemas de arquivos (uso e inodes), dispositivos (throughput, IOPS, ocupação),
-   gráfico de throughput, explorador "o que ocupa espaço?" e candidatos à limpeza
+   gráfico de throughput, **saúde SMART** opcional (via `smartctl`, sob demanda; o número de série nunca
+   é exposto), explorador "o que ocupa espaço?" **em segundo plano** (com progresso, cache de 5 min e
+   prioridade baixa) e candidatos à limpeza
    (**apenas listados com o comando sugerido; o Pulse nunca os executa**).
-5. **Processos** — tabela filtrável/ordenável; encerrar (SIGTERM → SIGKILL após 5 s), pausar/continuar e
+5. **Processos** — tabela filtrável/ordenável com **E/S de disco por processo** (`/proc/PID/io`) e
+   **visão em árvore** (CPU e RSS somados por subárvore); encerrar (SIGTERM → SIGKILL após 5 s), pausar/continuar e
    prioridade (renice), sempre com confirmação.
 6. **Serviços** — systemd de usuário e de sistema, filtros, busca, iniciar/parar/reiniciar; timers do systemd
-   (próxima/última execução), cron (crontab do usuário, `/etc/crontab`, `/etc/cron.d` e `cron.{daily,...}`,
+   (próxima/última execução), **CPU e memória por unidade** a partir do cgroup v2 (sem root),
+   botão **Logs** que abre a tela Logs filtrada pela unidade, cron (crontab do usuário, `/etc/crontab`, `/etc/cron.d` e `cron.{daily,...}`,
    com variáveis ocultas e senhas/tokens mascarados) e contêineres Docker (estado, portas, CPU/memória sob
-   demanda e iniciar/parar/reiniciar com confirmação e auditoria).
+   demanda — ou pelo cgroup, sem `docker stats` —, **logs do contêiner** e iniciar/parar/reiniciar com
+   confirmação e auditoria).
 7. **Rede** — ↓/↑, conexões TCP por estado, interfaces e portas em escuta com processo dono e marca
    "só local" / "acessível na rede".
 8. **Logs** — journalctl (sistema/usuário), unidade, prioridade, nº de linhas, busca e "seguir".
@@ -116,12 +123,16 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 | `GET /api/health` | estado do daemon (sem dados do sistema) |
 | `GET /api/snapshot` | última amostra completa |
 | `GET /api/history` | anel de 900 pontos (15 min a 1 s), formato colunar |
-| `GET /api/history/long?range=1h\|6h\|24h\|7d` | médias de 60 s (até 7 dias) |
+| `GET /api/history/long?range=1h\|6h\|24h\|7d\|30d\|90d` | médias de 60 s (até 7 dias) |
 | `GET /api/stream` | SSE: `event: snapshot` a cada amostra e `event: hook` |
 | `GET /api/processes` · `POST /api/processes/{pid}/{terminate\|kill\|pause\|resume\|renice}` | processos |
 | `GET /api/services?scope=user\|system` · `POST /api/services/action` | systemd |
 | `GET /api/logs?scope=&unit=&priority=&lines=&q=&cursor=` | journald |
 | `GET /api/timers?scope=user\|system` · `GET /api/cron` | agendamentos |
+| `GET /api/cgroups` | CPU/memória por unidade systemd e contêiner (cgroup v2) |
+| `GET /api/disk/smart` | saúde dos discos via `smartctl` (opcional) |
+| `GET /api/disk/usage?path=&refresh=1` | explorador de espaço em segundo plano (`pending` + progresso, depois o resultado) |
+| `GET /api/containers/logs?id=&lines=` | últimas linhas de log de um contêiner |
 | `GET /api/containers[?stats=1]` · `POST /api/containers/action` | Docker |
 | `GET /api/disk/usage?path=` · `GET /api/disk/cleanup` | espaço em disco |
 | `GET /api/agents` · `GET /api/agents/hooks` · `POST /api/agents/hooks/install` · `POST /api/agents/hook` | agentes |
@@ -169,7 +180,9 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 
 `LongStore` (`pulse-core::longterm`) agrega as amostras em médias de 60 s (`bucket = ts / 60_000`,
 `ts` em ms), retém 7 dias (10 080 pontos) e grava em `~/.local/state/pulse/history.log`, só-anexar.
-A retenção é configurável (`[history] retention_days`, até 90 dias). Linhas inválidas são ignoradas ao carregar; quando o arquivo passa de 2× a capacidade, é compactado via
+A retenção é configurável (`[history] retention_days`, até 90 dias). Uma segunda camada em
+`history-15m.log` guarda médias de 15 min por 90 dias (preenchida a partir da camada de 1 min na primeira
+execução) e atende às faixas de 30 e 90 dias. Linhas inválidas são ignoradas ao carregar; quando o arquivo passa de 2× a capacidade, é compactado via
 arquivo temporário + `rename`. Erros de E/S ficam em `/api/health` (`long_error`) e nunca derrubam o daemon.
 
 ## Estrutura
@@ -215,7 +228,12 @@ Seja honesto com o que existe:
 - **Tauri / ícone na bandeja**: só a interface web.
 - **Helper polkit próprio**: ações em serviços de sistema chamam `systemctl` e dependem do agente polkit
   da sessão. **Esse fluxo não foi testado.**
-- **SMART** (saúde de discos, exige root/`smartctl`) e **eBPF**: não implementados.
+- **SMART**: implementado via `smartctl`, mas **não testado em hardware real** (o smartmontools não
+  está instalado na máquina de desenvolvimento; só o parser foi testado com saídas de exemplo). Ler SMART
+  normalmente exige root ou o grupo `disk`.
+- **eBPF**: não implementado.
+- **RAPL**: o consumo da CPU só aparece se `/sys/class/powercap/intel-rapl:0/energy_uj` for legível;
+  em kernels recentes ele é restrito ao root. Bateria só testada com dados de exemplo (máquina desktop).
 - **Docker**: só via CLI `docker` (precisa do usuário no grupo `docker`); sem logs de contêiner nem Podman.
 - **Sessões do OpenClaw/"Ponto"**: só processos e hooks; o formato das transcrições não foi mapeado.
 - **Hooks do Codex/OpenClaw**: sem instalação automática (o trecho do Codex é exibido para colar).

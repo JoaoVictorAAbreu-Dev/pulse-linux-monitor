@@ -35,6 +35,7 @@ pub struct LongStore {
     pub last_error: Option<String>,
     pub compactions: u64,
     retention_ms: u64,
+    bucket_ms: u64,
 }
 
 fn fmt_line(p: &Point) -> String {
@@ -101,6 +102,17 @@ impl LongStore {
 
     /// Como `open`, com retenção explícita (ex.: `dias × 86 400 000`).
     pub fn open_with(path: impl Into<PathBuf>, cap: usize, retention_ms: u64, now_ms: u64) -> Self {
+        Self::open_tier(path, BUCKET_MS, cap, retention_ms, now_ms)
+    }
+
+    /// Camada com bucket próprio (ex.: 15 min para 90 dias).
+    pub fn open_tier(
+        path: impl Into<PathBuf>,
+        bucket_ms: u64,
+        cap: usize,
+        retention_ms: u64,
+        now_ms: u64,
+    ) -> Self {
         let path = path.into();
         let mut s = LongStore {
             path,
@@ -110,7 +122,8 @@ impl LongStore {
             file_lines: 0,
             last_error: None,
             compactions: 0,
-            retention_ms: retention_ms.max(BUCKET_MS),
+            retention_ms: retention_ms.max(bucket_ms.max(1)),
+            bucket_ms: bucket_ms.max(1),
         };
         s.load(now_ms);
         s
@@ -160,7 +173,7 @@ impl LongStore {
     /// Acrescenta uma amostra (ts em ms). Fecha a média do minuto anterior
     /// quando a amostra pertence a um novo bucket.
     pub fn add(&mut self, p: Point) {
-        let bucket = p.ts / BUCKET_MS;
+        let bucket = p.ts / self.bucket_ms;
         if let Some(acc) = &self.acc {
             if acc.bucket != bucket {
                 let done = self.acc.take().unwrap();
@@ -193,7 +206,7 @@ impl LongStore {
         }
         let n = a.n as f64;
         let p = Point {
-            ts: a.bucket * BUCKET_MS,
+            ts: a.bucket * self.bucket_ms,
             cpu: a.sum.cpu / n,
             mem: a.sum.mem / n,
             swap: a.sum.swap / n,
@@ -287,11 +300,56 @@ impl LongStore {
         }
     }
 
+    pub fn bucket_ms(&self) -> u64 {
+        self.bucket_ms
+    }
+
+    /// Se esta camada estiver vazia, preenche agregando os pontos de uma
+    /// camada mais fina (ex.: médias de 15 min a partir das de 1 min).
+    /// Devolve quantos pontos foram criados.
+    pub fn backfill_from(&mut self, finer: &LongStore) -> usize {
+        if !self.points.is_empty() || finer.points.is_empty() {
+            return 0;
+        }
+        let mut acc: Option<Acc> = None;
+        let mut made = Vec::new();
+        for p in finer.points() {
+            let b = p.ts / self.bucket_ms;
+            if acc.as_ref().map(|a| a.bucket != b).unwrap_or(false) {
+                made.push(acc.take().unwrap());
+            }
+            let a = acc.get_or_insert_with(|| Acc {
+                bucket: b,
+                ..Default::default()
+            });
+            a.n += 1;
+            a.sum.cpu += p.cpu;
+            a.sum.mem += p.mem;
+            a.sum.swap += p.swap;
+            a.sum.rx += p.rx;
+            a.sum.tx += p.tx;
+            a.sum.rd += p.rd;
+            a.sum.wr += p.wr;
+            if p.temp.is_finite() {
+                a.sum.temp += p.temp;
+                a.temp_n += 1;
+            }
+        }
+        // o último bucket pode estar incompleto: fica aberto para continuar
+        // recebendo amostras ao vivo.
+        self.acc = acc;
+        let n = made.len();
+        for a in made {
+            self.commit(a);
+        }
+        n
+    }
+
     /// JSON colunar com pontos a partir de `since_ms`.
     pub fn to_json(&self, since_ms: u64) -> String {
         let it = self.points.iter().filter(move |p| p.ts >= since_ms);
         crate::json::Obj::new()
-            .u("bucket_ms", BUCKET_MS)
+            .u("bucket_ms", self.bucket_ms)
             .u(
                 "count",
                 self.points.iter().filter(|p| p.ts >= since_ms).count() as u64,
@@ -414,6 +472,31 @@ mod tests {
         // fechados: 0..8; retenção de 3 min a partir do último (8) mantém 5..8
         assert_eq!(s.len(), 4);
         assert_eq!(s.points().next().unwrap().cpu, 5.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coarse_tier_backfill_and_live() {
+        let dir = tmpdir("tier");
+        let q = 15 * BUCKET_MS;
+        let b0 = T0 - T0 % q;
+        let mut fine = LongStore::open(dir.join("fine.log"), 1000, b0);
+        for m in 0..31 {
+            fine.add(pt(b0 + m * BUCKET_MS, (m % 15) as f64));
+        }
+        assert_eq!(fine.len(), 30);
+        let mut coarse = LongStore::open_tier(dir.join("coarse.log"), q, 100, 90 * 86_400_000, T0);
+        assert_eq!(coarse.backfill_from(&fine), 1, "1º quarto de hora fechado");
+        assert_eq!(coarse.points().next().unwrap().ts, b0);
+        assert!((coarse.points().next().unwrap().cpu - 7.0).abs() < 1e-9);
+        assert_eq!(coarse.backfill_from(&fine), 0, "só preenche quando vazia");
+        // amostras ao vivo continuam o bucket aberto e fecham o seguinte
+        coarse.add(pt(b0 + 2 * q, 1.0));
+        assert_eq!(coarse.len(), 2);
+        let reload =
+            LongStore::open_tier(dir.join("coarse.log"), q, 100, 90 * 86_400_000, b0 + 3 * q);
+        assert_eq!(reload.len(), 2);
+        assert!(coarse.to_json(0).contains("\"bucket_ms\":900000"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

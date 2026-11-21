@@ -6,6 +6,7 @@ use crate::sys;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 const REAL_FS: &[&str] = &[
@@ -271,16 +272,17 @@ impl DuResult {
     }
 }
 
-struct Budget {
+struct Budget<'a> {
     files: u64,
     start: Instant,
     max_files: u64,
     max_ms: u128,
     truncated: bool,
     errors: u64,
+    progress: Option<&'a AtomicU64>,
 }
 
-fn tree_size(p: &Path, dev: u64, b: &mut Budget) -> u64 {
+fn tree_size(p: &Path, dev: u64, b: &mut Budget<'_>) -> u64 {
     let Ok(rd) = std::fs::read_dir(p) else {
         b.errors += 1;
         return 0;
@@ -288,6 +290,11 @@ fn tree_size(p: &Path, dev: u64, b: &mut Budget) -> u64 {
     let mut total = 0;
     for e in rd.flatten() {
         b.files += 1;
+        if b.files.is_multiple_of(1024) {
+            if let Some(p) = b.progress {
+                p.store(b.files, Ordering::Relaxed);
+            }
+        }
         if b.files > b.max_files || b.start.elapsed().as_millis() > b.max_ms {
             b.truncated = true;
             return total;
@@ -307,6 +314,16 @@ fn tree_size(p: &Path, dev: u64, b: &mut Budget) -> u64 {
 /// Tamanho de cada filho de `path` (sem atravessar outros sistemas de arquivos),
 /// com limites de arquivos e de tempo.
 pub fn du(path: &str, max_files: u64, max_ms: u128) -> Result<DuResult, String> {
+    du_with_progress(path, max_files, max_ms, None)
+}
+
+/// Como `du`, publicando em `progress` quantas entradas já foram visitadas.
+pub fn du_with_progress(
+    path: &str,
+    max_files: u64,
+    max_ms: u128,
+    progress: Option<&AtomicU64>,
+) -> Result<DuResult, String> {
     let p = Path::new(path);
     if !p.is_absolute() {
         return Err("caminho precisa ser absoluto".into());
@@ -324,6 +341,7 @@ pub fn du(path: &str, max_files: u64, max_ms: u128) -> Result<DuResult, String> 
         max_ms,
         truncated: false,
         errors: 0,
+        progress,
     };
     let mut entries = Vec::new();
     let rd = std::fs::read_dir(&p).map_err(|e| e.to_string())?;

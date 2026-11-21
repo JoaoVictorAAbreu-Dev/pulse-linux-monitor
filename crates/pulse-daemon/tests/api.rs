@@ -476,3 +476,81 @@ fn cli_once_help_and_errors() {
     let out = env.cmd().args(["--bind", "0.0.0.0"]).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "rede exige --allow-remote");
 }
+
+#[test]
+fn phase2_routes() {
+    let env = Env::new("fase2");
+    let big = env.root.join("home/dados");
+    std::fs::create_dir_all(big.join("sub")).unwrap();
+    std::fs::write(big.join("sub/arquivo"), vec![7u8; 128 * 1024]).unwrap();
+    let d = start(&env, &[]);
+    let tok = env.token();
+    let h = [("X-Pulse-Token", tok.as_str())];
+
+    // snapshot traz GPU, energia e "quem está na swap"
+    let (_, _, b) = req(&d, "GET", "/api/snapshot", &h, "");
+    let v = j(&b);
+    assert!(v.get("gpus").and_then(|x| x.as_array()).is_some());
+    assert!(v.get("power").is_some());
+    assert!(v
+        .path(&["procs", "top_swap"])
+        .and_then(|x| x.as_array())
+        .is_some());
+
+    // processos expõem E/S (o próprio daemon é legível)
+    let (_, _, b) = req(&d, "GET", "/api/processes", &h, "");
+    let own = j(&b)
+        .get("list")
+        .and_then(|l| l.as_array())
+        .and_then(|l| {
+            l.iter()
+                .find(|p| p.get("pid").and_then(|x| x.as_f64()) == Some(d.child.id() as f64))
+                .cloned()
+        })
+        .expect("daemon na lista");
+    assert!(own.get("io_rd").and_then(|x| x.as_f64()).is_some());
+
+    // cgroups e SMART respondem JSON mesmo sem suporte/permissão
+    let (st, _, b) = req(&d, "GET", "/api/cgroups", &h, "");
+    assert_eq!(st, 200);
+    assert!(j(&b).get("available").is_some());
+    let (st, _, b) = req(&d, "GET", "/api/disk/smart", &h, "");
+    assert_eq!(st, 200);
+    assert!(j(&b).get("available").is_some());
+
+    // logs de contêiner validam o identificador
+    assert_eq!(
+        req(&d, "GET", "/api/containers/logs?id=--help", &h, "").0,
+        400
+    );
+
+    // du em segundo plano: pending → resultado → cache
+    let path = format!("/api/disk/usage?path={}", big.to_string_lossy());
+    let (_, _, b) = req(&d, "GET", &path, &h, "");
+    assert!(b.contains("\"pending\":true"));
+    let done = wait_for(
+        || {
+            try_req(d.port, "GET", &path, &h, "")
+                .map(|r| r.2.contains("\"entries\""))
+                .unwrap_or(false)
+        },
+        10,
+    );
+    assert!(done, "varredura terminou");
+    let (_, _, b) = req(&d, "GET", &path, &h, "");
+    let v = j(&b);
+    assert!(v.get("total").and_then(|x| x.as_f64()).unwrap() >= 128.0 * 1024.0);
+    assert!(v.get("cached_s").is_some(), "segunda leitura vem do cache");
+
+    // faixas longas usam a camada de 15 min
+    let (_, _, b) = req(&d, "GET", "/api/history/long?range=90d", &h, "");
+    assert_eq!(
+        j(&b).get("bucket_ms").and_then(|x| x.as_f64()),
+        Some(900_000.0)
+    );
+    let (_, _, b) = req(&d, "GET", "/api/history/long?range=7d", &h, "");
+    assert_eq!(
+        j(&b).get("bucket_ms").and_then(|x| x.as_f64()),
+        Some(60_000.0)
+    );
+}

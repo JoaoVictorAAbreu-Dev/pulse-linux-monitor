@@ -30,6 +30,7 @@ extern "C" {
     fn sysconf(name: i32) -> i64;
     fn getuid() -> u32;
     fn getpid() -> i32;
+    fn gettid() -> i32;
 }
 
 const SC_CLK_TCK: i32 = 2;
@@ -92,6 +93,19 @@ pub fn renice(pid: i32, nice: i32) -> Result<(), String> {
     }
     // SAFETY: PRIO_PROCESS = 0; sem ponteiros.
     let rc = unsafe { setpriority(0, pid as u32, nice.clamp(-20, 19)) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+/// Baixa a prioridade (nice) só da thread atual — no Linux o nice é por
+/// thread. Usado em trabalho pesado de fundo, como a varredura de espaço.
+pub fn lower_thread_priority(nice: i32) -> Result<(), String> {
+    // SAFETY: gettid/setpriority são chamadas simples, sem ponteiros.
+    let tid = unsafe { gettid() };
+    let rc = unsafe { setpriority(0, tid as u32, nice.clamp(0, 19)) };
     if rc == 0 {
         Ok(())
     } else {
@@ -289,6 +303,34 @@ mod tests {
     fn statvfs_root() {
         let s = fs_stat("/").expect("statvfs /");
         assert!(s.total > 0 && s.avail <= s.total);
+    }
+
+    #[test]
+    fn lowers_only_this_thread() {
+        let h = std::thread::spawn(|| {
+            lower_thread_priority(10).unwrap();
+            std::fs::read_to_string("/proc/thread-self/stat").unwrap()
+        });
+        let st = h.join().unwrap();
+        let after = st
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(16)
+            .unwrap()
+            .to_string();
+        assert_eq!(after, "10");
+        let me = std::fs::read_to_string("/proc/thread-self/stat").unwrap();
+        let mine = me
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .nth(16)
+            .unwrap()
+            .to_string();
+        assert_ne!(mine, "10", "a thread do teste não muda");
     }
 
     #[test]

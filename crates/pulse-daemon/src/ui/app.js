@@ -70,7 +70,7 @@
   // ------------------------------------------------------------ estado
   const S = {
     snap: null,
-    hist: { ts: [], cpu: [], mem: [], swap: [], rx: [], tx: [], rd: [], wr: [], temp: [] },
+    hist: { ts: [], cpu: [], mem: [], swap: [], rx: [], tx: [], rd: [], wr: [], temp: [], gpu: [] },
     lastSeq: 0,
     page: null,
     agents: null,
@@ -86,6 +86,7 @@
       ts: s.ts, cpu: s.cpu.total, mem: s.mem.pct, swap: s.mem.swap_pct,
       rx: s.net.rx_bps, tx: s.net.tx_bps, rd: s.disks.read_bps, wr: s.disks.write_bps,
       temp: maxTemp(s),
+      gpu: s.gpus && s.gpus.length ? s.gpus[0].busy_pct : null,
     };
     for (const k in h) { h[k].push(p[k]); if (h[k].length > HIST_MAX) h[k].shift(); }
   }
@@ -123,8 +124,9 @@
 
   // ------------------------------------------------------------ diálogos
   let dialogResolve = null;
-  function dialog({ title, body, actions }) {
+  function dialog({ title, body, actions, wide }) {
     const ov = $('#overlay');
+    $('.dialog', ov).classList.toggle('wide', !!wide);
     $('#dlg-title').textContent = title;
     $('#dlg-body').innerHTML = body;
     const box = $('#dlg-actions');
@@ -293,7 +295,8 @@
       chart(el, { series: [{ data: p.cpu, color: 'var(--acento)' }, { data: p.mem, color: 'var(--violeta)' }], ts: p.ts, max: 100, spanLabel: p.ts.length ? 'auto' : '—' });
     }
     const n = longRange === '15m' ? S.hist.ts.length : longData ? longData.count : 0;
-    html('ov-chart-note', longRange === '15m' ? `${n} amostras de 1 s` : `${n} médias de 60 s (histórico longo)`);
+    const bucket = longData && longData.bucket_ms >= 900000 ? '15 min' : '60 s';
+    html('ov-chart-note', longRange === '15m' ? `${n} amostras de 1 s` : `${n} médias de ${bucket} (histórico longo)`);
   }
 
   page('visao-geral', 'Visão geral', 'grid', {
@@ -303,7 +306,7 @@
         <div class="grid g3">${kpi('k-disk', ring(0, 'var(--acento)'))}${kpi('k-net')}${kpi('k-temp')}</div>
         <div class="grid g-main">
           ${card('CPU e memória', `<div id="ov-chart"></div><div class="toolbar"><div class="series-legend"><span><i class="dot" style="background:var(--acento)"></i>CPU</span><span><i class="dot" style="background:var(--violeta)"></i>Memória</span></div><span class="sp"></span><span class="muted" id="ov-chart-note"></span></div>`,
-            `<span class="sp"></span><span class="seg" id="ov-range">${['15m', '1h', '24h', '7d'].map((r) => `<button data-r="${r}" aria-pressed="${r === longRange}">${r === '15m' ? '15 min' : r.replace('h', ' h').replace('d', ' d')}</button>`).join('')}</span>`)}
+            `<span class="sp"></span><span class="seg" id="ov-range">${['15m', '1h', '24h', '7d', '30d', '90d'].map((r) => `<button data-r="${r}" aria-pressed="${r === longRange}">${r === '15m' ? '15 min' : r.replace('h', ' h').replace('d', ' d')}</button>`).join('')}</span>`)}
           ${card('Alertas', '<div id="ov-alerts"></div>')}
         </div>
         <div class="grid g2">
@@ -388,7 +391,9 @@
       el.innerHTML = `
         <div class="grid g-main">${card('Histórico', '<div id="cpu-chart"></div>')}${card('Detalhes', '<dl class="kv" id="cpu-kv"></dl>')}</div>
         ${panel('Núcleos', '<div class="tiles" id="cpu-cores"></div>', '<span class="sp"></span><span class="muted" id="cpu-model" style="text-transform:none;letter-spacing:0;font-weight:500"></span>')}
-        ${panel('Temperaturas', '<div class="tiles" id="cpu-temps"></div>')}`;
+        ${panel('Temperaturas', '<div class="tiles" id="cpu-temps"></div>')}
+        <div id="cpu-gpu-wrap"></div>
+        <div id="cpu-power-wrap"></div>`;
     },
     update(s) {
       const c = s.cpu;
@@ -405,8 +410,41 @@
       html('cpu-temps', s.temps.length
         ? s.temps.map((t) => { const ref = t.crit || 100; return `<div class="tile"><div class="t" title="${esc(t.chip)}">${esc(t.chip)} · ${esc(t.label)}</div><div class="v">${num(t.c, 0)} °C</div>${barHtml((t.c / ref) * 100, t.c > 88 ? 'crit' : t.c > 75 ? 'warn' : 'ok')}</div>`; }).join('')
         : '<p class="empty">Nenhum sensor de temperatura disponível.</p>');
+      renderGpus(s.gpus || []);
+      renderPower(s.power);
     },
   });
+
+  function renderGpus(gpus) {
+    const wrap = $('#cpu-gpu-wrap');
+    if (!wrap) return;
+    if (!gpus.length) { wrap.innerHTML = ''; return; }
+    if (!$('#gpu-tiles')) {
+      wrap.innerHTML = panel('GPU', '<div class="grid g-main"><div id="gpu-chart"></div><div class="tiles" id="gpu-tiles" style="grid-template-columns:1fr"></div></div>');
+    }
+    chart($('#gpu-chart'), { series: [{ data: S.hist.gpu, color: 'var(--violeta)' }], ts: S.hist.ts, max: 100, height: 180 });
+    const memBar = (u, t) => (u != null && t ? `${barHtml((u / t) * 100, lvl((u / t) * 100, 85, 95))}<div class="t" style="margin-top:4px">${bytes(u)} de ${bytes(t)}</div>` : '<div class="t">—</div>');
+    html('gpu-tiles', gpus.map((g) => `<div class="tile">
+      <div class="t" title="${esc(g.name)}">${esc(g.vendor)} · ${esc(g.name)} <span class="muted">(${esc(g.driver || g.card)})</span></div>
+      <div class="v">${g.busy_pct == null ? '—' : pct(g.busy_pct, 0)} <span class="sub" style="font-size:13px;font-weight:500">${[g.freq_mhz != null ? num(g.freq_mhz, 0) + ' MHz' : '', g.temp_c != null ? num(g.temp_c, 0) + ' °C' : '', g.power_w != null ? num(g.power_w, 1) + ' W' : ''].filter(Boolean).join(' · ')}</span></div>
+      ${g.busy_pct != null ? barHtml(g.busy_pct, lvl(g.busy_pct, 80, 95)) : ''}
+      <div class="t" style="margin-top:10px">VRAM</div>${memBar(g.vram_used, g.vram_total)}
+      ${g.gtt_total ? `<div class="t" style="margin-top:8px">GTT (memória do sistema usada pela GPU)</div>${memBar(g.gtt_used, g.gtt_total)}` : ''}
+    </div>`).join(''));
+  }
+
+  function renderPower(pw) {
+    const wrap = $('#cpu-power-wrap');
+    if (!wrap) return;
+    if (!pw || (!pw.batteries.length && pw.cpu_w == null && !pw.note)) { wrap.innerHTML = ''; return; }
+    const st = { Charging: 'carregando', Discharging: 'descarregando', Full: 'cheia', 'Not charging': 'sem carregar' };
+    const bats = pw.batteries.map((b) => `<div class="tile"><div class="t">Bateria ${esc(b.name)} · ${esc(st[b.status] || b.status)}</div>
+      <div class="v">${b.capacity_pct == null ? '—' : pct(b.capacity_pct, 0)}</div>${barHtml(b.capacity_pct, b.capacity_pct < 15 ? 'crit' : b.capacity_pct < 30 ? 'warn' : 'ok')}
+      <div class="t" style="margin-top:6px">${[b.power_w != null ? num(b.power_w, 1) + ' W' : '', b.hours_left != null ? dur(b.hours_left * 3600) + (b.status === 'Charging' ? ' para carregar' : ' restantes') : '', b.health_pct != null ? 'saúde ' + pct(b.health_pct, 0) : ''].filter(Boolean).join(' · ')}</div></div>`).join('');
+    const cpu = pw.cpu_w != null ? `<div class="tile"><div class="t">Pacote da CPU (RAPL)</div><div class="v">${num(pw.cpu_w, 1)} W</div></div>` : '';
+    const ac = pw.ac_online == null ? '' : `<span class="chip">${pw.ac_online ? 'na tomada' : 'na bateria'}</span>`;
+    wrap.innerHTML = panel('Energia', `<div class="tiles">${bats}${cpu}</div>${pw.note ? `<p class="muted">${esc(pw.note)}.</p>` : ''}`, `<span class="sp"></span>${ac}`);
+  }
 
   // ---- 3. Memória
   page('memoria', 'Memória', 'mem', {
@@ -418,7 +456,10 @@
           ${card('Histórico', '<div id="m-chart"></div><div class="series-legend"><span><i class="dot" style="background:var(--violeta)"></i>Memória</span><span><i class="dot" style="background:var(--aviso)"></i>Swap</span></div>')}
           ${card('Detalhes', '<dl class="kv" id="m-kv"></dl>')}
         </div>
-        ${card('Maiores consumidores de memória', '<div id="m-top"></div>')}`;
+        <div class="grid g2">
+          ${card('Maiores consumidores de memória', '<div id="m-top"></div>')}
+          ${card('Quem está na swap', '<div id="m-swap-top"></div>')}
+        </div>`;
     },
     update(s) {
       const m = s.mem;
@@ -439,21 +480,35 @@
         ['Mortes por OOM (desde o boot)', num(m.oom_kills)], ['Pressão (PSI) 10 s', psi],
       ].map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join(''));
       html('m-top', consumersTable(s.procs.top_mem, true));
+      const sw = s.procs.top_swap || [];
+      html('m-swap-top', sw.length ? `<div class="table-wrap"><table><thead><tr><th>Processo</th><th class="num">Na swap</th><th class="num">Na RAM</th></tr></thead><tbody>
+        ${sw.map((p) => `<tr><td class="trunc-s" title="${esc(p.cmd)}">${esc(p.name)} <span class="muted">· ${esc(p.pid)}</span></td><td class="num"><b>${bytes(p.swap)}</b></td><td class="num">${bytes(p.rss)}</td></tr>`).join('')}
+        </tbody></table></div><p class="muted">Muita memória na swap com "swap in" alto deixa o sistema lento: fechar ou reiniciar esses processos libera a swap.</p>`
+        : `<p class="empty">${m.swap_total ? 'Nenhum processo legível está usando a swap.' : 'Swap desativada.'}</p>`);
     },
   });
 
   // ---- 4. Discos
   let duPath = store.get('pulse.du') || '';
-  async function loadDu(path) {
-    html('du-body', '<p class="empty">Calculando… (pode levar alguns segundos)</p>');
+  let duTimer = 0;
+  async function loadDu(path, refresh) {
+    clearTimeout(duTimer);
     try {
-      const r = await api('/api/disk/usage' + (path ? '?path=' + encodeURIComponent(path) : ''));
+      const q = new URLSearchParams();
+      if (path) q.set('path', path);
+      if (refresh) q.set('refresh', '1');
+      const r = await api('/api/disk/usage?' + q);
+      if (r.pending) {
+        html('du-body', `<p class="empty">Varrendo ${esc(r.path)} em segundo plano… ${num(r.scanned)} entradas em ${num(r.elapsed_s, 0)} s. Você pode sair desta tela; o resultado fica guardado por 5 min.</p>`);
+        if (S.page && S.page.id === 'discos') duTimer = setTimeout(() => loadDu(r.path), 1000);
+        return;
+      }
       duPath = r.path;
       store.set('pulse.du', duPath);
       const parts = r.path.split('/').filter(Boolean);
       let acc = '';
       const crumbs = [`<button data-p="/">/</button>`].concat(parts.map((p) => { acc += '/' + p; return `<button data-p="${esc(acc)}">${esc(p)}</button>`; }));
-      html('du-crumbs', crumbs.join('<span class="muted">›</span>') + `<span class="sp"></span><span class="muted">total ${bytes(r.total)}${r.truncated ? ' · varredura parcial (limite de tempo/arquivos)' : ''}${r.errors ? ` · ${r.errors} sem permissão` : ''}</span>`);
+      html('du-crumbs', crumbs.join('<span class="muted">›</span>') + `<span class="sp"></span><span class="muted">total ${bytes(r.total)}${r.truncated ? ' · varredura parcial (limite de tempo/arquivos)' : ''}${r.errors ? ` · ${r.errors} sem permissão` : ''}${r.cached_s != null ? ` · calculado há ${dur(r.cached_s)}` : ''}</span>`);
       const max = r.entries.length ? r.entries[0].size : 1;
       html('du-body', r.entries.length ? `<div class="table-wrap tall"><table><thead><tr><th>Nome</th><th style="width:40%">Proporção</th><th class="num">Tamanho</th></tr></thead><tbody>
         ${r.entries.map((e) => `<tr class="${e.dir ? 'clickable' : ''}" ${e.dir ? `data-p="${esc(e.path)}" tabindex="0"` : ''}><td class="trunc">${e.dir ? '📁 ' : ''}${esc(e.name)}</td><td>${barHtml((e.size / (max || 1)) * 100)}</td><td class="num">${bytes(e.size)}</td></tr>`).join('')}
@@ -461,6 +516,23 @@
     } catch (e) {
       html('du-body', `<p class="empty">Erro: ${esc(e.message)}</p>`);
     }
+  }
+  async function loadSmart() {
+    html('d-smart', '<p class="empty">Consultando o smartctl (≈ 1 s por disco)…</p>');
+    try {
+      const r = await api('/api/disk/smart');
+      if (!r.available) {
+        html('d-smart', `<p class="sub">${esc(r.reason)}. Para habilitar: <code class="cmd">${esc(r.install)}</code></p><p class="muted">Ler SMART exige root ou o grupo <code class="cmd">disk</code>; o Pulse não pede privilégios sozinho.</p>`);
+        return;
+      }
+      html('d-smart', `<div class="table-wrap"><table><thead><tr><th>Disco</th><th>Modelo</th><th>Saúde</th><th class="num">Temperatura</th><th class="num">Horas ligado</th><th class="num">Setores realocados / pendentes</th><th class="num">NVMe: desgaste / erros</th></tr></thead><tbody>
+        ${r.disks.map((d) => `<tr><td><b>${esc(d.device)}</b></td><td class="trunc-s">${esc(d.model || '—')}</td>
+          <td>${d.error ? `<span class="muted">${esc(d.error)}</span>` : d.passed === true ? pill('aprovado', 'ok') : d.passed === false ? pill('FALHOU', 'crit') : '—'}</td>
+          <td class="num">${d.temp_c == null ? '—' : num(d.temp_c, 0) + ' °C'}</td><td class="num">${d.power_on_hours == null ? '—' : num(d.power_on_hours)}</td>
+          <td class="num">${d.reallocated == null ? '—' : num(d.reallocated)} / ${d.pending == null ? '—' : num(d.pending)}</td>
+          <td class="num">${d.nvme_used_pct == null ? '—' : pct(d.nvme_used_pct, 0)} / ${d.media_errors == null ? '—' : num(d.media_errors)}</td></tr>`).join('')}
+        </tbody></table></div>`);
+    } catch (e) { html('d-smart', `<p class="empty">Erro: ${esc(e.message)}</p>`); }
   }
   page('discos', 'Discos', 'disk', {
     mount(el) {
@@ -471,6 +543,7 @@
           ${card('Pressão de E/S', '<dl class="kv" id="d-kv"></dl>')}
         </div>
         ${card('Dispositivos', '<div id="d-dev"></div>')}
+        ${card('Saúde dos discos (SMART)', '<div id="d-smart"><p class="sub">Leitura sob demanda via <code class="cmd">smartctl</code>.</p></div>', '<span class="sp"></span><button class="btn sm" id="d-smart-go">Verificar</button>')}
         ${panel('O que ocupa espaço?', '<div class="crumbs toolbar" id="du-crumbs"></div><div id="du-body" style="margin-top:10px"></div>', '<span class="sp"></span><button class="btn sm" id="du-home">Pasta pessoal</button><button class="btn sm" id="du-reload">Atualizar</button>')}
         ${panel('Candidatos à limpeza', '<p class="sub">O Pulse <b>nunca executa</b> estes comandos — só sugere. Revise antes de rodar no terminal.</p><div id="d-clean"><p class="empty">Calculando tamanhos…</p></div>')}`;
       const nav = (e) => { const t = e.target.closest('[data-p]'); if (t) loadDu(t.dataset.p); };
@@ -478,7 +551,8 @@
       $('#du-body').addEventListener('click', nav);
       $('#du-body').addEventListener('keydown', (e) => { if (e.key === 'Enter') nav(e); });
       $('#du-home').addEventListener('click', () => loadDu(''));
-      $('#du-reload').addEventListener('click', () => loadDu(duPath));
+      $('#du-reload').addEventListener('click', () => loadDu(duPath, true));
+      $('#d-smart-go').addEventListener('click', loadSmart);
       loadDu(duPath);
       api('/api/disk/cleanup').then((list) => {
         html('d-clean', list.length ? `<div class="table-wrap"><table><thead><tr><th>Item</th><th>Caminho</th><th class="num">Tamanho</th><th>Comando sugerido</th></tr></thead><tbody>
@@ -486,6 +560,7 @@
           </tbody></table></div>` : '<p class="empty">Nada a sugerir.</p>');
       }).catch((e) => html('d-clean', `<p class="empty">Erro: ${esc(e.message)}</p>`));
     },
+    unmount() { clearTimeout(duTimer); },
     update(s) {
       html('d-fs', `<div class="table-wrap"><table><thead><tr><th>Montagem</th><th>Dispositivo</th><th>Tipo</th><th style="width:28%">Uso</th><th class="num">Usado / total</th><th class="num">Livre</th><th class="num">Inodes</th></tr></thead><tbody>
         ${s.disks.fs.map((f) => `<tr><td><b>${esc(f.mount)}</b></td><td class="mono">${esc(f.device)}</td><td>${esc(f.fstype)}</td><td>${barHtml(f.pct, lvl(f.pct, 90, 97))}</td><td class="num">${bytes(f.used)} / ${bytes(f.total)} · ${pct(f.pct, 0)}</td><td class="num">${bytes(f.avail)}</td><td class="num">${pct(f.inodes_pct, 0)}</td></tr>`).join('')}
@@ -502,7 +577,7 @@
   });
 
   // ---- 5. Processos
-  const P = { list: [], sort: { k: 'cpu', dir: -1 }, filter: '', mine: false, timer: 0 };
+  const P = { list: [], sort: { k: 'cpu', dir: -1 }, filter: '', mine: false, timer: 0, view: store.get('pulse.pview') || 'lista' };
   const STATE_NAMES = { R: 'rodando', S: 'dormindo', D: 'E/S', I: 'ocioso', Z: 'zumbi', T: 'parado', t: 'rastreado', X: 'morto' };
   async function loadProcs() {
     clearTimeout(P.timer);
@@ -516,24 +591,63 @@
     } catch { /* tenta de novo */ }
     if (S.page && S.page.id === 'processos') P.timer = setTimeout(loadProcs, 2000);
   }
+  const ioCell = (p) => (p.io_rd == null ? '<span class="muted" title="sem permissão para /proc/PID/io">—</span>' : `${rate(p.io_rd)} / ${rate(p.io_wr)}`);
+  const procActions = (p) => `<div class="actions" data-pid="${p.pid}" data-name="${esc(p.name)}">
+          <button class="btn sm" data-a="${p.state === 'T' ? 'resume' : 'pause'}">${p.state === 'T' ? 'Continuar' : 'Pausar'}</button>
+          <button class="btn sm" data-a="renice" data-nice="${p.nice}">Prioridade</button>
+          <button class="btn sm danger" data-a="terminate">Encerrar</button></div>`;
+  function renderTree() {
+    const f = P.filter.toLowerCase();
+    const byPid = new Map(P.list.map((p) => [p.pid, p]));
+    const kids = new Map();
+    for (const p of P.list) { if (!kids.has(p.ppid)) kids.set(p.ppid, []); kids.get(p.ppid).push(p); }
+    // totais da subárvore
+    const tot = new Map();
+    const sum = (p, depth = 0) => {
+      if (tot.has(p.pid)) return tot.get(p.pid);
+      let c = p.cpu, r = p.rss;
+      if (depth < 64) for (const k of kids.get(p.pid) || []) { const t = sum(k, depth + 1); c += t[0]; r += t[1]; }
+      const t = [c, r]; tot.set(p.pid, t); return t;
+    };
+    const match = (p) => (!f || p.cmd.toLowerCase().includes(f) || p.name.toLowerCase().includes(f) || String(p.pid) === f || p.user.toLowerCase() === f) && (!P.mine || !S.user || p.user === S.user);
+    // com filtro: mostra os que casam e seus ancestrais
+    let keep = null;
+    if (f || P.mine) {
+      keep = new Set();
+      for (const p of P.list) if (match(p)) { let q = p, g = 0; while (q && !keep.has(q.pid) && g++ < 64) { keep.add(q.pid); q = byPid.get(q.ppid); } }
+    }
+    const roots = P.list.filter((p) => !byPid.has(p.ppid));
+    const rows = [];
+    const walk = (p, depth) => {
+      if (rows.length >= 400 || (keep && !keep.has(p.pid))) return;
+      rows.push([p, depth]);
+      const ch = (kids.get(p.pid) || []).slice().sort((a, b) => sum(b)[0] - sum(a)[0] || sum(b)[1] - sum(a)[1]);
+      for (const k of ch) walk(k, depth + 1);
+    };
+    roots.sort((a, b) => sum(b)[0] - sum(a)[0]).forEach((r) => walk(r, 0));
+    $('#p-count').textContent = `${rows.length} processos na árvore${rows.length >= 400 ? ' (limite de 400)' : ''}`;
+    html('p-table', `<table class="t-compact"><thead><tr><th>Processo</th><th class="num">PID</th><th>Usuário</th><th class="num">CPU</th><th class="num">CPU (árvore)</th><th class="num" title="Soma do RSS da subárvore; memória compartilhada entra mais de uma vez">RSS somado</th><th class="num">Ações</th></tr></thead><tbody>
+      ${rows.map(([p, d]) => { const t = sum(p); const n = (kids.get(p.pid) || []).length; return `<tr><td class="trunc" title="${esc(p.cmd)}" style="padding-left:${10 + d * 18}px">${d ? '<span class="muted">└ </span>' : ''}<b>${esc(p.name)}</b>${n ? ` <span class="muted">(${n})</span>` : ''}</td>
+        <td class="num">${p.pid}</td><td>${esc(p.user)}</td><td class="num">${pct(p.cpu)}</td><td class="num"><b>${pct(t[0])}</b></td><td class="num">${bytes(t[1])}</td><td>${procActions(p)}</td></tr>`; }).join('')}
+      </tbody></table><p class="muted">RSS somado conta memória compartilhada (bibliotecas, abas do mesmo navegador) mais de uma vez; use como ordem de grandeza.</p>`);
+  }
   function renderProcs() {
+    if (P.view === 'arvore') { renderTree(); return; }
     const f = P.filter.toLowerCase();
     let rows = P.list.filter((p) => !f || p.cmd.toLowerCase().includes(f) || p.name.toLowerCase().includes(f) || String(p.pid) === f || p.user.toLowerCase() === f);
     if (P.mine && S.user) rows = rows.filter((p) => p.user === S.user);
     const { k, dir } = P.sort;
-    rows.sort((a, b) => (a[k] < b[k] ? -dir : a[k] > b[k] ? dir : 0));
+    const key = (p) => (k === 'io' ? (p.io_rd ?? -1) + (p.io_wr ?? 0) : p[k]);
+    rows.sort((a, b) => (key(a) < key(b) ? -dir : key(a) > key(b) ? dir : 0));
     const total = rows.length;
     rows = rows.slice(0, 300);
     $('#p-count').textContent = total > 300 ? `mostrando 300 de ${total}` : `${total} processos`;
-    const cols = [['pid', 'PID', 1], ['user', 'Usuário'], ['state', 'Estado'], ['cpu', 'CPU', 1], ['rss', 'RAM', 1], ['threads', 'Threads', 1], ['nice', 'Nice', 1], ['cmd', 'Comando']];
+    const cols = [['pid', 'PID', 1], ['user', 'Usuário'], ['state', 'Estado'], ['cpu', 'CPU', 1], ['rss', 'RAM', 1], ['io', 'Disco L/E', 1], ['threads', 'Threads', 1], ['nice', 'Nice', 1], ['cmd', 'Comando']];
     html('p-table', `<table class="t-compact"><thead><tr>${cols.map(([c, t, n]) => `<th class="sortable ${n ? 'num' : ''}" data-k="${c}" aria-sort="${P.sort.k === c ? (dir > 0 ? 'ascending' : 'descending') : 'none'}">${t}</th>`).join('')}<th class="num">Ações</th></tr></thead><tbody>
       ${rows.map((p) => `<tr><td class="num">${p.pid}</td><td>${esc(p.user)}</td><td>${pill(STATE_NAMES[p.state] || p.state, p.state === 'R' ? 'ok' : p.state === 'Z' ? 'crit' : p.state === 'T' ? 'warn' : '')}</td>
-        <td class="num">${pct(p.cpu)}</td><td class="num">${bytes(p.rss)}</td><td class="num">${p.threads}</td><td class="num">${p.nice}</td>
-        <td class="trunc" title="${esc(p.cmd)}"><b>${esc(p.name)}</b> <span class="muted">${esc(p.cmd)}</span></td>
-        <td><div class="actions" data-pid="${p.pid}" data-name="${esc(p.name)}">
-          <button class="btn sm" data-a="${p.state === 'T' ? 'resume' : 'pause'}">${p.state === 'T' ? 'Continuar' : 'Pausar'}</button>
-          <button class="btn sm" data-a="renice" data-nice="${p.nice}">Prioridade</button>
-          <button class="btn sm danger" data-a="terminate">Encerrar</button></div></td></tr>`).join('')}
+        <td class="num">${pct(p.cpu)}</td><td class="num">${bytes(p.rss)}</td><td class="num">${ioCell(p)}</td><td class="num">${p.threads}</td><td class="num">${p.nice}</td>
+        <td class="trunc p-cmd" title="${esc(p.cmd)}"><b>${esc(p.name)}</b> <span class="muted">${esc(p.cmd)}</span></td>
+        <td>${procActions(p)}</td></tr>`).join('')}
       </tbody></table>`);
   }
   async function procAction(pid, name, action, curNice) {
@@ -575,15 +689,17 @@
         ${panel('', `<div class="toolbar" style="margin-bottom:12px">
             <input id="p-filter" class="input" type="search" placeholder="Filtrar por nome, comando, PID ou usuário" style="flex:1;max-width:420px" value="${esc(P.filter)}">
             <label class="chk"><input type="checkbox" id="p-mine" ${P.mine ? 'checked' : ''}> só meus</label>
+            <span class="seg" id="p-view"><button data-v="lista" aria-pressed="${P.view === 'lista'}">Lista</button><button data-v="arvore" aria-pressed="${P.view === 'arvore'}">Árvore</button></span>
             <span class="sp"></span><span class="muted" id="p-count"></span></div>
           <div class="table-wrap tall" id="p-table"><p class="empty">Carregando…</p></div>`)}`;
       $('#p-filter').addEventListener('input', (e) => { P.filter = e.target.value; renderProcs(); });
       $('#p-mine').addEventListener('change', (e) => { P.mine = e.target.checked; renderProcs(); });
+      $('#p-view').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; P.view = b.dataset.v; store.set('pulse.pview', P.view); $$('#p-view button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); renderProcs(); });
       $('#p-table').addEventListener('click', (e) => {
         const th = e.target.closest('th[data-k]');
         if (!th) return;
         const k = th.dataset.k;
-        P.sort = { k, dir: P.sort.k === k ? -P.sort.dir : (k === 'cpu' || k === 'rss' || k === 'threads' ? -1 : 1) };
+        P.sort = { k, dir: P.sort.k === k ? -P.sort.dir : (k === 'cpu' || k === 'rss' || k === 'threads' || k === 'io' ? -1 : 1) };
         renderProcs();
       });
       loadProcs();
@@ -592,11 +708,18 @@
   });
 
   // ---- 6. Serviços
-  const SV = { scope: 'user', filter: 'todos', q: '', units: [], timer: 0 };
+  const SV = { scope: 'user', filter: 'todos', q: '', units: [], timer: 0, cg: new Map(), ct: [] };
+  async function loadCgroups() {
+    try {
+      const r = await api('/api/cgroups');
+      SV.cg = new Map(r.units.map((u) => [u.scope + ':' + u.unit, u]));
+      SV.ctUsage = r.units.filter((u) => u.container);
+    } catch { /* opcional */ }
+  }
   async function loadServices() {
     clearTimeout(SV.timer);
     try {
-      const r = await api('/api/services?scope=' + SV.scope);
+      const [r] = await Promise.all([api('/api/services?scope=' + SV.scope), loadCgroups()]);
       SV.units = r.units;
       renderServices();
     } catch (e) { html('sv-table', `<p class="empty">Erro: ${esc(e.message)}</p>`); }
@@ -614,11 +737,13 @@
     for (const u of SV.units) { if (u.active === 'active') counts.ativos++; else if (u.active === 'failed') counts.falhas++; else if (u.active === 'inactive') counts.inativos++; }
     $$('#sv-filter button').forEach((b) => { b.textContent = `${b.dataset.label} (${counts[b.dataset.f]})`; });
     const st = (u) => (u.active === 'active' ? pill(u.sub === 'running' ? 'rodando' : u.sub, 'ok') : u.active === 'failed' ? pill('falhou', 'crit') : u.active === 'activating' ? pill('iniciando', 'info') : pill(u.active === 'inactive' ? 'inativo' : u.active));
-    html('sv-table', rows.length ? `<table><thead><tr><th>Unidade</th><th>Descrição</th><th>Estado</th><th>Habilitado</th><th class="num">Ações</th></tr></thead><tbody>
-      ${rows.map((u) => `<tr><td class="trunc-s" title="${esc(u.name)}"><b>${esc(u.name.replace(/\.service$/, ''))}</b></td><td class="trunc">${esc(u.description)}</td><td>${st(u)}</td><td>${esc(u.enabled || '—')}</td>
+    html('sv-table', rows.length ? `<table class="t-compact"><thead><tr><th>Unidade</th><th>Descrição</th><th>Estado</th><th>Habilitado</th><th class="num">CPU</th><th class="num">Memória</th><th class="num">Ações</th></tr></thead><tbody>
+      ${rows.map((u) => { const cg = SV.cg.get(SV.scope + ':' + u.name); return `<tr><td class="trunc-s" title="${esc(u.name)}"><b>${esc(u.name.replace(/\.service$/, ''))}</b></td><td class="trunc">${esc(u.description)}</td><td>${st(u)}</td><td>${esc(u.enabled || '—')}</td>
+        <td class="num">${cg && cg.cpu != null ? pct(cg.cpu) : '—'}</td><td class="num">${cg && cg.mem ? bytes(cg.mem) : '—'}</td>
         <td><div class="actions" data-unit="${esc(u.name)}">
+          <button class="btn sm ghost" data-v="logs">Logs</button>
           ${u.active === 'active' ? '<button class="btn sm" data-v="restart">Reiniciar</button><button class="btn sm danger" data-v="stop">Parar</button>' : '<button class="btn sm primary" data-v="start">Iniciar</button>'}
-        </div></td></tr>`).join('')}</tbody></table>` : '<p class="empty">Nenhum serviço corresponde ao filtro.</p>');
+        </div></td></tr>`; }).join('')}</tbody></table>` : '<p class="empty">Nenhum serviço corresponde ao filtro.</p>');
   }
   const fmtWhen = (ms) => (ms ? `${dateTime(ms)} (${ms > Date.now() ? 'em ' + dur((ms - Date.now()) / 1000) : ago(ms)})` : '—');
   async function loadTimers() {
@@ -637,15 +762,30 @@
         + (per ? `<div class="toolbar" style="margin-top:10px">${per}</div>` : '') + '<p class="muted">Variáveis de ambiente do crontab não são exibidas e valores que parecem senhas/tokens são mascarados.</p>');
     } catch (e) { html('sv-cron', `<p class="empty">Erro: ${esc(e.message)}</p>`); }
   }
+  const ctUse = (c) => (SV.ctUsage || []).find((u) => u.container.startsWith(c.id));
+  async function containerLogs(id, name) {
+    let r;
+    try { r = await api('/api/containers/logs?lines=300&id=' + encodeURIComponent(id)); } catch (e) { toast('Logs: ' + e.message, true); return; }
+    const done = dialog({
+      title: `Logs de ${name}`,
+      wide: true,
+      body: `<p class="muted">Últimas 300 linhas (stdout + stderr, horário UTC do Docker).</p><div class="logs" id="ct-logs" style="max-height:60vh;white-space:pre-wrap">${esc(r.text) || '<span class="muted">sem saída</span>'}</div>`,
+      actions: [{ label: 'Fechar', cls: 'primary', value: true }],
+    });
+    const box = $('#ct-logs');
+    if (box) box.scrollTop = box.scrollHeight;
+    await done;
+  }
   async function loadContainers(stats) {
     try {
+      if (!SV.ctUsage) await loadCgroups();
       const r = await api('/api/containers' + (stats ? '?stats=1' : ''));
       if (!r.available) { html('sv-ct', `<p class="empty">Docker indisponível: ${esc(r.error || '')}</p>`); return; }
       const st = (c) => (c.state === 'running' ? pill('rodando', 'ok') : c.state === 'exited' ? pill('parado') : c.state === 'paused' ? pill('pausado', 'warn') : c.state === 'restarting' ? pill('reiniciando', 'info') : pill(c.state, c.state === 'dead' ? 'crit' : ''));
       html('sv-ct', r.containers.length ? `<p class="sub">Docker ${esc(r.version)} · ${r.containers.filter((c) => c.state === 'running').length} de ${r.containers.length} em execução</p><div class="table-wrap"><table class="t-compact"><thead><tr><th>Contêiner</th><th>Imagem</th><th>Estado</th><th>Status</th><th>Portas</th><th class="num">CPU</th><th class="num">Memória</th><th class="num">Ações</th></tr></thead><tbody>
         ${r.containers.map((c) => `<tr><td class="trunc-s" title="${esc(c.name)}"><b>${esc(c.name)}</b><div class="muted mono" style="font-size:11.5px">${esc(c.id)}${c.compose ? ' · ' + esc(c.compose) : ''}</div></td><td class="trunc-s">${esc(c.image)}</td><td>${st(c)}</td><td class="trunc-s">${esc(c.status)}</td><td class="mono trunc-s" title="${esc(c.ports)}">${esc(c.ports || '—')}</td>
-          <td class="num">${c.cpu == null ? '—' : pct(c.cpu)}</td><td class="num">${esc(c.mem || '—')}</td>
-          <td><div class="actions" data-ct="${esc(c.id)}" data-ctname="${esc(c.name)}">${c.state === 'running' ? '<button class="btn sm" data-c="restart">Reiniciar</button><button class="btn sm danger" data-c="stop">Parar</button>' : '<button class="btn sm primary" data-c="start">Iniciar</button>'}</div></td></tr>`).join('')}
+          <td class="num">${c.cpu != null ? pct(c.cpu) : ctUse(c) && ctUse(c).cpu != null ? pct(ctUse(c).cpu) : '—'}</td><td class="num">${c.mem ? esc(c.mem) : ctUse(c) ? bytes(ctUse(c).mem) : '—'}</td>
+          <td><div class="actions" data-ct="${esc(c.id)}" data-ctname="${esc(c.name)}"><button class="btn sm ghost" data-c="logs">Logs</button>${c.state === 'running' ? '<button class="btn sm" data-c="restart">Reiniciar</button><button class="btn sm danger" data-c="stop">Parar</button>' : '<button class="btn sm primary" data-c="start">Iniciar</button>'}</div></td></tr>`).join('')}
         </tbody></table></div>` : '<p class="empty">Nenhum contêiner.</p>');
     } catch (e) { html('sv-ct', `<p class="empty">Erro: ${esc(e.message)}</p>`); }
   }
@@ -671,17 +811,23 @@
         const b = e.target.closest('button[data-v]');
         if (!b) return;
         const unit = b.parentElement.dataset.unit, v = b.dataset.v;
+        if (v === 'logs') {
+          LG.scope = SV.scope; LG.unit = unit; LG.prio = ''; LG.q = ''; LG.cursor = '';
+          location.hash = '#/logs';
+          return;
+        }
         const verb = { start: 'Iniciar', stop: 'Parar', restart: 'Reiniciar' }[v];
         if (!(await confirmAction(`${verb} serviço?`, `<p>${verb} <b>${esc(unit)}</b> (escopo ${SV.scope === 'user' ? 'usuário' : 'sistema'})?</p><p class="muted">A ação é registrada no log de auditoria.</p>`, verb, v === 'stop' ? 'danger' : 'primary'))) return;
         try { await api('/api/services/action', { method: 'POST', body: { scope: SV.scope, unit, action: v } }); toast(`${verb}: ${unit} — ok`); } catch (err) { toast('Falhou: ' + err.message, true); }
         loadServices();
       });
-      $('#sv-ct-reload').addEventListener('click', () => loadContainers(false));
+      $('#sv-ct-reload').addEventListener('click', async () => { await loadCgroups(); loadContainers(false); });
       $('#sv-ct-stats').addEventListener('click', () => { html('sv-ct', '<p class="empty">Medindo (docker stats leva alguns segundos)…</p>'); loadContainers(true); });
       $('#sv-ct').addEventListener('click', async (e) => {
         const b = e.target.closest('button[data-c]');
         if (!b) return;
         const box = b.parentElement, v = b.dataset.c;
+        if (v === 'logs') { containerLogs(box.dataset.ct, box.dataset.ctname); return; }
         const verb = { start: 'Iniciar', stop: 'Parar', restart: 'Reiniciar' }[v];
         if (!(await confirmAction(`${verb} contêiner?`, `<p>${verb} <b>${esc(box.dataset.ctname)}</b>?</p><p class="muted">A ação é registrada no log de auditoria.</p>`, verb, v === 'stop' ? 'danger' : 'primary'))) return;
         try { await api('/api/containers/action', { method: 'POST', body: { id: box.dataset.ct, action: v } }); toast(`${verb}: ${box.dataset.ctname} — ok`); } catch (err) { toast('Falhou: ' + err.message, true); }
@@ -1019,6 +1165,8 @@
     try {
       const hist = await api('/api/history');
       for (const k in S.hist) S.hist[k] = (hist[k] || []).map((v) => (v == null ? null : v));
+      // a GPU não está no anel do servidor: começa vazia, alinhada ao tempo
+      S.hist.gpu = S.hist.ts.map(() => null);
     } catch { /* começa vazio */ }
     try { const snap = await api('/api/snapshot'); if (snap && snap.cpu) { S.snap = snap; S.lastSeq = snap.seq; renderHeader(snap); } } catch { /* idem */ }
     route();
