@@ -929,24 +929,72 @@
 
   // ---- 9. Agentes
   let openSession = null;
+  const fmtMs = (ms) => (ms == null ? '—' : ms < 1000 ? `${num(ms, 0)} ms` : ms < 60000 ? `${num(ms / 1000, 1)} s` : dur(ms / 1000));
+  const usd = (v) => (v == null ? '—' : v < 0.01 && v > 0 ? '< US$ 0,01' : 'US$ ' + num(v, 2));
+  /** Preço de um modelo: nome exato ou o prefixo mais longo cadastrado. */
+  function priceFor(model) {
+    const prices = (S.agents && S.agents.prefs && S.agents.prefs.prices) || {};
+    if (!model) return null;
+    if (prices[model]) return prices[model];
+    let best = null;
+    for (const k of Object.keys(prices)) if (model.startsWith(k) && (!best || k.length > best.length)) best = k;
+    return best ? prices[best] : null;
+  }
+  const costOf = (model, tin, tout, cr, cw) => {
+    const p = priceFor(model);
+    return p ? (tin * p[0] + tout * p[1] + cr * p[2] + cw * p[3]) / 1e6 : null;
+  };
+  const sessionCost = (s) => costOf(s.model, s.tokens_in, s.tokens_out, s.tokens_cache_read || 0, s.tokens_cache_write || 0);
+  /** Estado de uma sessão: hook mais recente ou inferido pela atividade da transcrição. */
+  function sessionState(s, h) {
+    const recent = Date.now() - s.updated < 30e3;
+    if (h && h.ts >= s.updated - 5e3) return statePill(h.state);
+    if (recent) return pill(h ? 'executando (inferido)' : 'ativa', 'ok');
+    if (h) return statePill(h.state);
+    return Date.now() - s.updated < 120e3 ? pill('ativa', 'ok') : pill('inativa');
+  }
+
   function renderAgentsPage() {
     const A = S.agents;
     if (!A || !$('#ag-kpis')) return;
     if (!A.enabled) { html('ag-body', '<p class="empty">Detecção de agentes desativada (--no-agents).</p>'); return; }
     const ps = A.processes, ss = A.sessions;
     const mcp = ps.flatMap((p) => p.mcp);
-    const day = ss.filter((s) => Date.now() - s.updated < 86400e3);
     const active = ss.filter((s) => Date.now() - s.updated < 5 * 60e3).length;
-    const tin = day.reduce((a, s) => a + s.tokens_in + s.tokens_cache, 0), tout = day.reduce((a, s) => a + s.tokens_out, 0);
+    const day24 = ss.filter((s) => Date.now() - s.updated < 86400e3);
     setKpi('ag-k1', 'Processos de agentes', String(ps.length), [...new Set(ps.map((p) => p.agent))].join(', ') || 'nenhum');
     setKpi('ag-k2', 'Servidores MCP', String(mcp.length), [...new Set(mcp.map((m) => m.name))].join(', ') || 'nenhum detectado');
-    setKpi('ag-k3', 'Sessões ativas / recentes', `${active} / ${day.length}`, 'ativas: últimos 5 min · recentes: 24 h');
-    setKpi('ag-k4', 'Tokens (sessões lidas)', kilo(tin + tout), `${kilo(tin)} entrada (c/ cache) · ${kilo(tout)} saída`);
+    setKpi('ag-k3', 'Sessões ativas / recentes', `${active} / ${day24.length}`, 'ativas: últimos 5 min · recentes: 24 h');
+    // tokens e custo de hoje a partir do índice diário
+    const rows = (A.usage && A.usage.rows) || [];
+    const today = rows.filter((r) => r.day === A.usage.today);
+    const tTok = today.reduce((a, r) => a + r.input + r.output + r.cache_read + r.cache_write, 0);
+    const tCosts = today.map((r) => costOf(r.model, r.input, r.output, r.cache_read, r.cache_write));
+    const priced = tCosts.filter((c) => c != null);
+    setKpi('ag-k4', 'Tokens hoje', kilo(tTok), priced.length ? `custo estimado ${usd(priced.reduce((a, c) => a + c, 0))}${priced.length < tCosts.length ? ' (parcial: há modelos sem preço)' : ''}` : 'cadastre preços em Preferências para ver o custo');
+
     const hs = A.hooks.sessions;
-    html('ag-live', hs.length ? `<div class="grid g3">${hs.slice(0, 6).map((h) => `<div class="agent-card"><div class="hd"><strong>${esc(agentName(h.agent))}</strong><span class="sp"></span>${statePill(h.state)}</div>
-        <div class="meta">sessão ${esc(h.session.slice(0, 8))} · ${ago(h.ts)}${h.cwd ? ' · ' + esc(h.cwd.split('/').pop()) : ''}</div>
-        <div class="toolbar">${h.event ? pill(h.event, 'info') : ''}<span class="sub trunc-s">${esc(h.tool || h.message || '')}</span></div></div>`).join('')}</div>`
+    const sessById = Object.fromEntries(ss.map((s) => [s.id, s]));
+    const live = hs.slice(0, 6).map((h) => {
+      const s = sessById[h.session];
+      const inferred = s && s.updated > h.ts + 5e3 && Date.now() - s.updated < 30e3;
+      return `<div class="agent-card"><div class="hd"><strong>${esc(agentName(h.agent))}</strong><span class="sp"></span>${inferred ? pill('executando (inferido)', 'ok') : statePill(h.state)}</div>
+        <div class="meta">sessão ${esc(h.session.slice(0, 8))} · ${ago(Math.max(h.ts, s ? s.updated : 0))}${h.cwd ? ' · ' + esc(h.cwd.split('/').pop()) : ''}</div>
+        <div class="toolbar">${h.event ? pill(h.event, h.event === 'PostToolUseFailure' ? 'crit' : h.event === 'PermissionRequest' ? 'warn' : 'info') : ''}<span class="sub trunc-s" title="${esc(h.tool || h.message || '')}">${esc(h.tool || h.message || '')}</span></div>
+        ${h.subagents || h.failures ? `<div class="toolbar" style="margin-top:6px">${h.subagents ? pill(`${h.subagents} subagente${h.subagents > 1 ? 's' : ''} rodando`, 'vio') : ''}${h.failures ? `<span title="última: ${esc(h.last_failure)}">${pill(`${h.failures} falha${h.failures > 1 ? 's' : ''} de ferramenta`, 'crit')}</span>` : ''}</div>` : ''}</div>`;
+    });
+    // Codex sem hook recente mas com transcrição ativa: "executando (inferido)"
+    const hookIds = new Set(hs.map((h) => h.session));
+    for (const s of ss) {
+      if (live.length >= 6) break;
+      if (s.agent === 'Codex' && !hookIds.has(s.id) && Date.now() - s.updated < 30e3) {
+        live.push(`<div class="agent-card"><div class="hd"><strong>Codex</strong><span class="sp"></span>${pill('executando (inferido)', 'ok')}</div>
+          <div class="meta">sessão ${esc(s.id.slice(0, 8))} · ${ago(s.updated)} · ${esc(s.project_name || '')}</div><p class="muted" style="margin:4px 0 0">Inferido pela transcrição em atividade (o notify do Codex só avisa no fim do turno).</p></div>`);
+      }
+    }
+    html('ag-live', live.length ? `<div class="grid g3">${live.join('')}</div>`
       : '<p class="empty">Nenhum evento de hook recebido ainda. Use “Conectar hooks” para o Claude Code enviar estados ao vivo.</p>');
+
     html('ag-procs', ps.length ? `<div class="grid g2">${ps.map((p) => `<div class="agent-card"><div class="hd"><strong>${esc(p.agent)}</strong><span class="muted">${esc(p.name)}</span><span class="sp"></span>${p.state === 'T' ? pill('pausado', 'warn') : pill('ativo', 'ok')}</div>
         <div class="meta"><span>PID <b>${p.pid}</b></span><span>CPU <b>${pct(p.tree_cpu)}</b></span><span>RAM <b>${bytes(p.tree_rss)}</b></span><span>${p.children} filho${p.children === 1 ? '' : 's'}</span></div>
         <div class="meta mono trunc" title="${esc(p.cwd || '')}">${esc(p.cwd || '—')}</div>
@@ -955,39 +1003,135 @@
           <button class="btn sm" data-a="${p.state === 'T' ? 'resume' : 'pause'}">${p.state === 'T' ? 'Continuar' : 'Pausar'}</button>
           <button class="btn sm danger" data-a="terminate">Encerrar</button></div></div>`).join('')}</div>`
       : '<p class="empty">Nenhum processo de agente em execução.</p>');
+
     const hookBySession = Object.fromEntries(hs.map((h) => [h.session, h]));
-    html('ag-sessions', ss.length ? `<div class="table-wrap"><table><thead><tr><th>Agente</th><th>Projeto</th><th>Estado</th><th>Modelo</th><th class="num">Pedidos</th><th class="num">Ferramentas</th><th class="num">Tokens in/out</th><th class="num">Atividade</th></tr></thead><tbody>
-      ${ss.map((s) => { const h = hookBySession[s.id]; const tools = s.tools.reduce((a, t) => a + t.n, 0); return `<tr class="clickable" data-sid="${esc(s.id)}" tabindex="0" aria-expanded="${openSession === s.id}">
-        <td><b>${esc(s.agent)}</b></td><td><div class="trunc-s"><b>${esc(s.project_name || '—')}</b></div><div class="muted mono trunc-s" style="font-size:11.5px">${esc(s.project)}</div></td>
-        <td>${h ? statePill(h.state) : Date.now() - s.updated < 120e3 ? pill('ativa', 'ok') : pill('inativa')}</td><td class="trunc-s">${esc(s.model || '—')}</td>
-        <td class="num">${s.prompts}</td><td class="num">${tools}</td><td class="num">${kilo(s.tokens_in + s.tokens_cache)} / ${kilo(s.tokens_out)}</td><td class="num">${ago(s.updated)}</td></tr>`; }).join('')}
-      </tbody></table></div><div id="ag-timeline"></div>` : '<p class="empty">Nenhuma transcrição recente em ~/.claude/projects ou ~/.codex/sessions.</p>');
+    const note = A.openclaw_note ? `<p class="sub">${esc(A.openclaw_note)}.</p>` : '';
+    html('ag-sessions', ss.length ? `${note}<div class="table-wrap"><table class="t-compact"><thead><tr><th>Agente</th><th>Projeto</th><th>Estado</th><th>Modelo</th><th class="num" title="pedidos do usuário / chamadas de ferramentas">Pedidos / ferr.</th><th class="num">Ativo / esperando você</th><th class="num">Tokens in/out</th><th class="num">Custo</th><th class="num">Atividade</th></tr></thead><tbody>
+      ${ss.map((s) => { const tools = s.tools.reduce((a, t) => a + t.n, 0); return `<tr class="clickable" data-sid="${esc(s.id)}" tabindex="0" aria-expanded="${openSession === s.id}">
+        <td style="white-space:nowrap"><b>${esc(s.agent)}</b>${s.subagent_msgs ? `<div class="muted" style="font-size:11.5px">${s.subagent_msgs} msgs de subagentes</div>` : ''}</td>
+        <td><div class="trunc-s"><b>${esc(s.title && s.agent.startsWith('OpenClaw') ? s.title : s.project_name || '—')}</b></div><div class="muted mono trunc-s" style="font-size:11.5px">${esc(s.project)}</div></td>
+        <td>${sessionState(s, hookBySession[s.id])}</td><td class="trunc-s" title="${esc(s.model)}">${esc(s.model || '—')}</td>
+        <td class="num">${s.agent.startsWith('OpenClaw') ? `${s.messages} msgs` : `${s.prompts} / ${tools}`}</td>
+        <td class="num">${s.active_ms || s.wait_ms ? `${fmtMs(s.active_ms)} / ${fmtMs(s.wait_ms)}` : '—'}</td>
+        <td class="num">${kilo(s.tokens_in + s.tokens_cache)} / ${kilo(s.tokens_out)}</td><td class="num">${usd(sessionCost(s))}</td><td class="num">${ago(s.updated)}</td></tr>`; }).join('')}
+      </tbody></table></div><div id="ag-timeline"></div>` : `${note}<p class="empty">Nenhuma sessão recente em ~/.claude/projects, ~/.codex/sessions ou no OpenClaw.</p>`);
     renderTimeline();
+    renderUsage();
+
     const ev = A.hooks.events;
-    html('ag-events', ev.length ? ev.slice(0, 30).map((e) => `<div class="toolbar" style="margin-bottom:6px"><span class="muted" style="width:70px">${ago(e.ts)}</span><b>${esc(agentName(e.agent))}</b>${statePill(e.state)}${e.event ? pill(e.event, 'info') : ''}<span class="sub trunc">${esc(e.tool || e.message)}</span></div>`).join('') : '<p class="empty">Sem eventos.</p>');
+    html('ag-events', ev.length ? ev.slice(0, 30).map((e) => `<div class="toolbar" style="margin-bottom:6px"><span class="muted" style="width:70px">${ago(e.ts)}</span><b>${esc(agentName(e.agent))}</b>${statePill(e.state)}${e.event ? pill(e.event, e.event === 'PostToolUseFailure' ? 'crit' : e.event === 'PermissionRequest' ? 'warn' : 'info') : ''}<span class="sub trunc" title="${esc(e.tool || e.message)}">${esc(e.tool || e.message)}</span></div>`).join('') : '<p class="empty">Sem eventos.</p>');
   }
+
   function renderTimeline() {
     const el = $('#ag-timeline');
     if (!el) return;
     const s = S.agents && S.agents.sessions.find((x) => x.id === openSession);
     if (!s) { el.innerHTML = ''; return; }
     const kinds = { prompt: ['var(--texto-3)', 'Pedido'], tool: ['var(--acento)', ''], reply: ['var(--violeta)', 'Resposta'], done: ['var(--ok)', 'Concluído'] };
-    el.innerHTML = `<div class="toolbar" style="margin-top:12px"><b>Linha do tempo</b><span class="muted">${esc(s.title || s.id)}</span><span class="sp"></span>${s.tools.slice(0, 8).map((t) => pill(`${t.name} ×${t.n}`, 'info')).join(' ')}</div>
-      <ol class="timeline">${s.timeline.slice().reverse().map((t) => { const [c, l] = kinds[t.kind] || ['var(--texto-3)', t.kind]; return `<li><i class="dot" style="background:${c}"></i><time>${esc(clock(t.ts))}</time><span>${esc(l || 'Ferramenta')}${t.kind === 'tool' ? ' · <b>' + esc(t.label) + '</b>' : ''}</span></li>`; }).join('')}</ol>
-      ${s.partial ? '<p class="muted">Transcrição grande: só o trecho final foi lido.</p>' : ''}<p class="muted">Por privacidade, o Pulse mostra só nomes de ferramentas — nunca o texto dos pedidos ou respostas.</p>`;
+    const timed = s.tools.filter((t) => t.avg_ms != null).sort((a, b) => b.avg_ms * b.n - a.avg_ms * a.n);
+    const details = S.agents.prefs && S.agents.prefs.show_tool_details;
+    const c = sessionCost(s);
+    el.innerHTML = `<div class="grid g-main" style="margin-top:12px;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)">
+      <div><div class="toolbar"><b>Linha do tempo</b><span class="muted trunc">${esc(s.title || s.id)}</span></div>
+        <ol class="timeline">${s.timeline.slice().reverse().map((t) => { const [cl, l] = kinds[t.kind] || ['var(--texto-3)', t.kind]; return `<li><i class="dot" style="background:${cl}"></i><time>${esc(clock(t.ts))}</time><span class="trunc">${esc(l || 'Ferramenta')}${t.kind === 'tool' ? ' · <b title="' + esc(t.label) + '">' + esc(t.label) + '</b>' : ''}</span></li>`; }).join('') || '<li class="muted">sem eventos</li>'}</ol></div>
+      <div><dl class="kv">
+        <dt>Duração</dt><dd>${s.started ? dur((s.updated - s.started) / 1000) : '—'}</dd>
+        <dt>Tempo ativo</dt><dd>${fmtMs(s.active_ms)}</dd>
+        <dt>Esperando você</dt><dd>${fmtMs(s.wait_ms)}</dd>
+        <dt>Tokens: entrada / saída</dt><dd>${kilo(s.tokens_in)} / ${kilo(s.tokens_out)}</dd>
+        <dt>Cache: leitura / escrita</dt><dd>${kilo(s.tokens_cache_read || 0)} / ${kilo(s.tokens_cache_write || 0)}</dd>
+        <dt>Custo estimado</dt><dd>${c == null ? (s.model ? 'sem preço para ' + esc(s.model) : '—') : usd(c)}</dd></dl>
+        ${timed.length ? `<div class="table-wrap" style="margin-top:12px"><table class="t-compact"><thead><tr><th>Ferramenta</th><th class="num">Chamadas</th><th class="num">Média</th><th class="num">Máx.</th></tr></thead><tbody>
+          ${timed.slice(0, 8).map((t) => `<tr><td class="trunc-s" title="${esc(t.name)}">${esc(t.name)}</td><td class="num">${t.n}</td><td class="num">${fmtMs(t.avg_ms)}</td><td class="num">${fmtMs(t.max_ms)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      </div></div>
+      ${s.partial ? '<p class="muted">Transcrição grande: só o trecho final foi lido.</p>' : ''}
+      <p class="muted">${details ? 'Modo detalhado ligado: a linha do tempo mostra comandos e caminhos das ferramentas (mascarados). ' : ''}O texto dos pedidos e respostas nunca é exibido. "Esperando você" = do fim de uma resposta até o próximo pedido.</p>`;
   }
+
+  function renderUsage() {
+    const el = $('#ag-usage');
+    if (!el || !S.agents) return;
+    const U = S.agents.usage || { rows: [] };
+    if (!U.rows.length) { el.innerHTML = '<p class="empty">Ainda sem dados (o índice dos últimos 30 dias é montado em segundo plano a cada 5 min).</p>'; return; }
+    // agrega por dia e agente
+    const days = [];
+    const end = new Date(U.today + 'T12:00:00Z');
+    for (let i = 29; i >= 0; i--) days.push(new Date(end - i * 86400e3).toISOString().slice(0, 10));
+    const agents = [...new Set(U.rows.map((r) => r.agent))];
+    const colors = { 'Claude Code': 'var(--acento)', Codex: 'var(--violeta)' };
+    const per = Object.fromEntries(days.map((d) => [d, {}]));
+    const perModel = {};
+    for (const r of U.rows) {
+      const t = r.input + r.output + r.cache_read + r.cache_write;
+      if (!t) continue;
+      if (per[r.day]) per[r.day][r.agent] = (per[r.day][r.agent] || 0) + t;
+      const m = (perModel[r.agent + '|' + r.model] ||= { agent: r.agent, model: r.model, input: 0, output: 0, cache_read: 0, cache_write: 0, cost: 0, priced: true });
+      m.input += r.input; m.output += r.output; m.cache_read += r.cache_read; m.cache_write += r.cache_write;
+      const c = costOf(r.model, r.input, r.output, r.cache_read, r.cache_write);
+      if (c == null) m.priced = false; else m.cost += c;
+    }
+    const max = Math.max(1, ...days.map((d) => agents.reduce((a, g) => a + (per[d][g] || 0), 0)));
+    const bars = days.map((d) => {
+      const segs = agents.map((g) => { const v = per[d][g] || 0; return v ? `<i title="${esc(g)}: ${kilo(v)} tokens" style="display:block;height:${(v / max) * 100}%;background:${colors[g] || 'var(--aviso)'}"></i>` : ''; }).join('');
+      return `<div title="${esc(d)}" style="flex:1;display:flex;flex-direction:column-reverse;height:140px;background:var(--trilho);border-radius:4px;overflow:hidden">${segs}</div>`;
+    }).join('');
+    const models = Object.values(perModel).sort((a, b) => (b.input + b.output + b.cache_read + b.cache_write) - (a.input + a.output + a.cache_read + a.cache_write));
+    const totalCost = models.filter((m) => m.priced).reduce((a, m) => a + m.cost, 0);
+    el.innerHTML = `<div style="display:flex;gap:3px;align-items:flex-end">${bars}</div>
+      <div class="toolbar" style="margin:6px 0 12px"><span class="muted">${esc(days[0])}</span><span class="sp"></span><div class="series-legend">${agents.map((g) => `<span><i class="dot" style="background:${colors[g] || 'var(--aviso)'}"></i>${esc(g)}</span>`).join('')}</div><span class="sp"></span><span class="muted">hoje</span></div>
+      <div class="table-wrap"><table><thead><tr><th>Agente</th><th>Modelo</th><th class="num">Entrada</th><th class="num">Saída</th><th class="num">Cache (leitura / escrita)</th><th class="num">Custo estimado</th></tr></thead><tbody>
+        ${models.map((m) => `<tr><td>${esc(m.agent)}</td><td class="trunc-s" title="${esc(m.model)}">${esc(m.model)}</td><td class="num">${kilo(m.input)}</td><td class="num">${kilo(m.output)}</td><td class="num">${kilo(m.cache_read)} / ${kilo(m.cache_write)}</td><td class="num">${m.priced ? usd(m.cost) : '<span class="muted">sem preço</span>'}</td></tr>`).join('')}
+      </tbody></table></div>
+      <p class="muted">Total com preço cadastrado em 30 dias: <b>${usd(totalCost)}</b>. Custos são estimativas a partir da tabela de preços que você cadastra (US$ por milhão de tokens); assinaturas com franquia não cobram por token.</p>`;
+  }
+
+  async function prefsDialog() {
+    let cfg;
+    try { cfg = await api('/api/agents'); } catch (e) { toast(e.message, true); return; }
+    const pr = cfg.prefs || { prices: {} };
+    const models = [...new Set([...(cfg.usage ? cfg.usage.rows.map((r) => r.model) : []), ...cfg.sessions.map((s) => s.model)].filter((m) => m && m !== '?'))].sort();
+    const row = (m, p) => `<tr data-row><td><input class="input mono" data-k="model" value="${esc(m)}" placeholder="modelo" list="pulse-models" style="width:100%"></td>${[0, 1, 2, 3].map((i) => `<td><input class="input" type="number" min="0" step="any" data-k="p${i}" value="${p ? esc(p[i]) : ''}" style="width:90px"></td>`).join('')}<td><button class="btn sm ghost" data-del>✕</button></td></tr>`;
+    const rows = Object.entries(pr.prices || {}).map(([m, p]) => row(m, p)).join('');
+    const done = dialog({
+      title: 'Preferências dos agentes',
+      wide: true,
+      body: `<label class="chk" style="margin:6px 0"><input type="checkbox" id="pf-notify" ${pr.notify_attention ? 'checked' : ''}> Avisar no desktop quando um agente pedir atenção (permissão, pergunta) — no máximo 1 aviso por minuto por sessão</label><br>
+        <label class="chk" style="margin:6px 0"><input type="checkbox" id="pf-details" ${pr.show_tool_details ? 'checked' : ''}> Modo detalhado: mostrar comandos e caminhos das ferramentas na linha do tempo e nos eventos ao vivo (valores que parecem senhas/tokens são mascarados; o texto das conversas nunca aparece)</label>
+        <h3 style="margin:16px 0 6px;font-size:14px">Preços (US$ por milhão de tokens)</h3>
+        <p class="muted" style="margin-top:0">O Pulse não traz preços prontos: confira os valores atuais no site do provedor. Um modelo casa pelo nome exato ou pelo prefixo mais longo (ex.: <code class="cmd">claude-opus</code> vale para todas as versões).</p>
+        <datalist id="pulse-models">${models.map((m) => `<option value="${esc(m)}">`).join('')}</datalist>
+        <div class="table-wrap"><table id="pf-prices"><thead><tr><th>Modelo</th><th>Entrada</th><th>Saída</th><th>Cache: leitura</th><th>Cache: escrita</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
+        <button class="btn sm" id="pf-add" style="margin-top:8px">Adicionar modelo</button>`,
+      actions: [{ label: 'Cancelar', value: null }, { label: 'Salvar', cls: 'primary', onclick: () => {
+        const prices = {};
+        for (const tr of $$('#pf-prices tr[data-row]')) {
+          const m = tr.querySelector('[data-k="model"]').value.trim();
+          if (!m) continue;
+          prices[m] = [0, 1, 2, 3].map((i) => Number(tr.querySelector(`[data-k="p${i}"]`).value || 0));
+        }
+        closeDialog({ notify_attention: $('#pf-notify').checked, show_tool_details: $('#pf-details').checked, prices });
+      } }],
+    });
+    $('#pf-add').addEventListener('click', () => $('#pf-prices tbody').insertAdjacentHTML('beforeend', row('', null)));
+    $('#pf-prices').addEventListener('click', (e) => { const b = e.target.closest('[data-del]'); if (b) b.closest('tr').remove(); });
+    const body = await done;
+    if (!body) return;
+    try { await api('/api/config/agents', { method: 'POST', body }); toast('Preferências salvas.'); } catch (e) { toast('Não salvou: ' + e.message, true); }
+    pollAgents();
+  }
+
   async function hooksDialog() {
     let info;
     try { info = await api('/api/agents/hooks'); } catch (e) { toast(e.message, true); return; }
     const conn = info.connected.length;
     const ok = await dialog({
       title: 'Conectar hooks',
-      body: `<p>Os hooks fazem o Claude Code avisar o Pulse quando está <b>executando</b>, <b>pedindo atenção</b>, <b>aguardando</b> ou <b>concluído</b>.</p>
+      body: `<p>Os hooks fazem o Claude Code avisar o Pulse quando está <b>executando</b>, <b>pedindo atenção</b> (inclusive pedidos de permissão), <b>aguardando</b> ou <b>concluído</b>, além de subagentes e falhas de ferramentas.</p>
         <dl class="kv"><dt>Arquivo</dt><dd class="mono trunc-s" title="${esc(info.settings)}">${esc(info.settings)}</dd>
         <dt>Script</dt><dd class="mono trunc-s" title="${esc(info.script)}">${esc(info.script)}</dd>
         <dt>Script instalado</dt><dd>${info.script_exists ? pill('sim', 'ok') : pill('não — rode install.sh', 'warn')}</dd>
         <dt>Eventos conectados</dt><dd>${conn} de ${info.total_events}</dd></dl>
-        <p class="sub">Instalar adiciona estes hooks ao <code class="cmd">settings.json</code>, preservando o que já existe e criando um backup <code class="cmd">settings.json.pulse-bak</code>:</p>
+        <p class="sub">Instalar adiciona os eventos que faltam ao <code class="cmd">settings.json</code>, preservando o que já existe e criando um backup <code class="cmd">settings.json.pulse-bak</code>:</p>
         <pre class="snippet mono">${esc(info.snippet)}</pre>
         <p class="sub"><b>Codex</b> ${info.codex_connected ? pill('conectado', 'ok') : pill('não conectado')} — adicione no início de <code class="cmd">~/.codex/config.toml</code> (antes de qualquer <code class="cmd">[tabela]</code>):</p>
         <pre class="snippet mono">${esc(info.codex_snippet)}</pre>
@@ -1003,14 +1147,16 @@
   page('agentes', 'Agentes', 'bot', {
     mount(el) {
       el.innerHTML = `
-        <div class="toolbar"><p class="lead">Processos, sessões e eventos dos agentes de IA rodando nesta máquina.</p><span class="sp"></span><button class="btn" id="ag-hooks">Conectar hooks</button></div>
+        <div class="toolbar"><p class="lead">Processos, sessões e eventos dos agentes de IA rodando nesta máquina.</p><span class="sp"></span><button class="btn" id="ag-prefs">Preferências</button><button class="btn" id="ag-hooks">Conectar hooks</button></div>
         <div id="ag-body" style="display:contents">
         <div class="grid g4" id="ag-kpis">${kpi('ag-k1')}${kpi('ag-k2')}${kpi('ag-k3')}${kpi('ag-k4')}</div>
         ${panel('Ao vivo (hooks)', '<div id="ag-live"></div>')}
         ${panel('Processos', '<div id="ag-procs"></div>')}
-        ${panel('Sessões (transcrições)', '<div id="ag-sessions"></div>')}
+        ${panel('Sessões', '<div id="ag-sessions"></div>')}
+        ${panel('Uso por dia (30 dias)', '<div id="ag-usage"></div>')}
         ${panel('Eventos recentes (hooks)', '<div id="ag-events"></div>')}</div>`;
       $('#ag-hooks').addEventListener('click', hooksDialog);
+      $('#ag-prefs').addEventListener('click', prefsDialog);
       const toggle = (e) => {
         const tr = e.target.closest('tr[data-sid]');
         if (!tr) return;

@@ -105,7 +105,20 @@ fn main() {
     for w in &warnings {
         eprintln!("pulse: config {}: {}", cfg_path.display(), w);
     }
-    let shared = Shared::new(cfg.clone(), token, allowed, rules, cfg_path, warnings);
+    let prefs = state::AgentPrefs {
+        notify_attention: file.notify_attention.unwrap_or(true),
+        show_tool_details: file.show_tool_details.unwrap_or(false),
+        prices: file.prices.clone(),
+    };
+    let shared = Shared::new(
+        cfg.clone(),
+        token,
+        allowed,
+        rules,
+        cfg_path,
+        warnings,
+        prefs,
+    );
     // O token nunca vai para o log: só o caminho do arquivo.
     eprintln!(
         "pulse: ouvindo em http://{} (intervalo {} ms)",
@@ -122,6 +135,9 @@ fn main() {
         eprintln!("pulse: histórico longo: {}", e);
     }
     state::spawn_collector(shared.clone());
+    if cfg.agents {
+        state::spawn_usage_indexer(shared.clone());
+    }
 
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };

@@ -31,6 +31,9 @@ pub struct State {
     pub sessions_json: Arc<String>,
     /// (sessões nas últimas 24 h, tokens dessas sessões)
     pub sessions_summary: (usize, u64),
+    /// Uso diário de tokens (30 dias), JSON pronto.
+    pub usage_json: Arc<String>,
+    pub openclaw_note: Option<String>,
     pub hooks: HookStore,
     pub hook_log: EventLog,
     pub alert_log: EventLog,
@@ -49,6 +52,31 @@ pub struct Shared {
     pub allowed_hosts: Vec<String>,
     pub config_path: PathBuf,
     pub config_warnings: Vec<String>,
+    pub prefs: RwLock<AgentPrefs>,
+    /// Último aviso de "pedindo atenção" por sessão (antispam).
+    pub attention_sent: Mutex<std::collections::HashMap<String, Instant>>,
+}
+
+/// Preferências dos agentes ([agents] e [prices] do config.toml).
+#[derive(Debug, Clone, Default)]
+pub struct AgentPrefs {
+    pub notify_attention: bool,
+    pub show_tool_details: bool,
+    pub prices: std::collections::BTreeMap<String, [f64; 4]>,
+}
+
+impl AgentPrefs {
+    pub fn to_json(&self) -> String {
+        let mut prices = Obj::new();
+        for (k, p) in &self.prices {
+            prices = prices.raw(k, &pulse_core::json::arr_n(p));
+        }
+        Obj::new()
+            .b("notify_attention", self.notify_attention)
+            .b("show_tool_details", self.show_tool_details)
+            .raw("prices", &prices.finish())
+            .finish()
+    }
 }
 
 pub const EVENT_CAP: usize = 300;
@@ -69,6 +97,7 @@ impl Shared {
         rules: Rules,
         config_path: PathBuf,
         config_warnings: Vec<String>,
+        prefs: AgentPrefs,
     ) -> Arc<Self> {
         let dir = sys::state_dir();
         let days = cfg.retention_days.max(1);
@@ -108,6 +137,8 @@ impl Shared {
                 agents_json: Arc::new("[]".into()),
                 sessions_json: Arc::new("[]".into()),
                 sessions_summary: (0, 0),
+                usage_json: Arc::new("{\"days\":30,\"rows\":[]}".into()),
+                openclaw_note: None,
                 hooks,
                 hook_log,
                 alert_log,
@@ -123,6 +154,8 @@ impl Shared {
             allowed_hosts,
             config_path,
             config_warnings,
+            prefs: RwLock::new(prefs),
+            attention_sent: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -219,6 +252,38 @@ pub fn alert_input(t: &Tick) -> alerts::Input {
     }
 }
 
+/// Notificação genérica no desktop (não bloqueia).
+pub fn notify_text(title: &str, body: &str, urgency: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["-a", "Pulse", "-u", urgency, title, body])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut c| {
+            std::thread::spawn(move || {
+                let _ = c.wait();
+            })
+        });
+}
+
+/// Índice de uso diário (30 dias) em thread própria, a cada 5 minutos.
+pub fn spawn_usage_indexer(shared: Arc<Shared>) {
+    std::thread::Builder::new()
+        .name("uso".into())
+        .spawn(move || {
+            let _ = sys::lower_thread_priority(10);
+            let mut idx = pulse_agents::usage::UsageIndex::new(&sys::home());
+            loop {
+                let agg = idx.scan(30);
+                let j = pulse_agents::usage::to_json(&agg, 30, idx.offset_s());
+                shared.lock().usage_json = Arc::new(j);
+                std::thread::sleep(Duration::from_secs(300));
+            }
+        })
+        .expect("thread do índice de uso");
+}
+
 fn notify(a: &alerts::Alert) {
     let urgency = if a.severity == alerts::Severity::Critical {
         "critical"
@@ -273,7 +338,14 @@ pub fn spawn_collector(shared: Arc<Shared>) {
                         .unwrap_or(true)
                     {
                         last_scan = Some(Instant::now());
+                        scanner.details = shared
+                            .prefs
+                            .read()
+                            .map(|p| p.show_tool_details)
+                            .unwrap_or(false);
                         let list = scanner.scan();
+                        let note = scanner.openclaw.note.clone();
+                        shared.lock().openclaw_note = note;
                         Some((sessions::list_json(&list), list))
                     } else {
                         None

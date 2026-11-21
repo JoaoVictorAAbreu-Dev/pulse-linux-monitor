@@ -402,6 +402,10 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         ("GET", "/api/disk/cleanup") => Response::ok_json(disk::cleanup_candidates()),
         ("GET", "/api/agents") => agents_json(sh),
         ("GET", "/api/agents/hooks") => hooks_info(),
+        ("POST", "/api/config/agents") => match body_json(req) {
+            Err(r) => r,
+            Ok(v) => config_agents(sh, &v, peer),
+        },
         ("POST", "/api/agents/hooks/install") => {
             let settings = sys::home().join(".claude/settings.json");
             let script = hook_script_path();
@@ -429,12 +433,22 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
             let agent = req.header("x-pulse-agent").unwrap_or("claude").to_string();
             let state = req.header("x-pulse-state").unwrap_or("").to_string();
             let payload = String::from_utf8_lossy(&req.body).into_owned();
+            let prefs = sh.prefs.read().map(|p| p.clone()).unwrap_or_default();
             let mut st = sh.lock();
-            match st.hooks.ingest(sys::now_ms(), &agent, &state, &payload) {
+            match st.hooks.ingest(
+                sys::now_ms(),
+                &agent,
+                &state,
+                &payload,
+                prefs.show_tool_details,
+            ) {
                 Ok(e) => {
                     st.hook_log.append(&e.to_json());
                     drop(st);
                     sh.tick.notify_all();
+                    if e.state == "atencao" && prefs.notify_attention {
+                        notify_attention(sh, &e);
+                    }
                     Response::ok_json("{\"ok\":true}")
                 }
                 Err(e) => Response::error(400, &e),
@@ -565,6 +579,125 @@ fn hooks_info() -> Response {
     )
 }
 
+/// Grava [agents] e [prices] no config.toml e aplica na hora.
+fn config_agents(sh: &Shared, v: &Value, peer: &str) -> Response {
+    let mut prefs = sh.prefs.read().map(|p| p.clone()).unwrap_or_default();
+    let mut agent_pairs: Vec<(String, String)> = Vec::new();
+    for k in ["notify_attention", "show_tool_details"] {
+        if let Some(x) = v.get(k) {
+            let Some(b) = x.as_bool() else {
+                return Response::error(400, &format!("{} precisa ser true ou false", k));
+            };
+            if k == "notify_attention" {
+                prefs.notify_attention = b;
+            } else {
+                prefs.show_tool_details = b;
+            }
+            agent_pairs.push((k.to_string(), b.to_string()));
+        }
+    }
+    let mut price_pairs: Option<Vec<(String, String)>> = None;
+    if let Some(Value::Obj(items)) = v.get("prices") {
+        let mut map = std::collections::BTreeMap::new();
+        for (model, val) in items {
+            if !settings::valid_model_key(model) {
+                return Response::error(400, &format!("nome de modelo inválido: {}", model));
+            }
+            let nums: Option<Vec<f64>> = val
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_f64()).collect());
+            let p = nums
+                .filter(|n| n.len() == 4)
+                .map(|n| {
+                    n.iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .and_then(|s| settings::parse_price(&s));
+            let Some(p) = p else {
+                return Response::error(
+                    400,
+                    &format!("preço de {} precisa ter 4 números ≥ 0", model),
+                );
+            };
+            map.insert(model.clone(), p);
+        }
+        price_pairs = Some(
+            map.iter()
+                .map(|(k, p)| (json::quote(k), settings::fmt_price(p)))
+                .collect(),
+        );
+        prefs.prices = map;
+    }
+    let mut src = std::fs::read_to_string(&sh.config_path).unwrap_or_default();
+    if !agent_pairs.is_empty() {
+        src = settings::rewrite_section(&src, "agents", &agent_pairs, false);
+    }
+    if let Some(pp) = &price_pairs {
+        src = settings::rewrite_section(&src, "prices", pp, true);
+    }
+    let res = settings::write_atomic(&sh.config_path, &src);
+    auth::audit(
+        "config.agents",
+        &sh.config_path.to_string_lossy(),
+        res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+        peer,
+    );
+    match res {
+        Ok(()) => {
+            let j = prefs.to_json();
+            if let Ok(mut p) = sh.prefs.write() {
+                *p = prefs;
+            }
+            Response::ok_json(Obj::new().b("ok", true).raw("prefs", &j).finish())
+        }
+        Err(e) => Response::error(
+            500,
+            &format!("não foi possível gravar a configuração: {}", e),
+        ),
+    }
+}
+
+/// Avisa no desktop que um agente pede atenção (no máximo 1×/min por sessão).
+fn notify_attention(sh: &Shared, e: &hooks::HookEvent) {
+    {
+        let mut sent = sh.attention_sent.lock().unwrap_or_else(|x| x.into_inner());
+        if let Some(t) = sent.get(&e.session) {
+            if t.elapsed().as_secs() < 60 {
+                return;
+            }
+        }
+        sent.insert(e.session.clone(), std::time::Instant::now());
+        if sent.len() > 200 {
+            sent.retain(|_, t| t.elapsed().as_secs() < 600);
+        }
+    }
+    let agent = match e.agent.as_str() {
+        "claude" => "Claude Code",
+        "codex" => "Codex",
+        "openclaw" | "ponto" => "OpenClaw",
+        other => other,
+    };
+    let project = e.cwd.rsplit('/').next().unwrap_or("");
+    let mut body = String::new();
+    if !project.is_empty() {
+        body.push_str(project);
+    }
+    if !e.message.is_empty() {
+        if !body.is_empty() {
+            body.push_str(" · ");
+        }
+        body.push_str(&e.message);
+    } else if !e.tool.is_empty() {
+        if !body.is_empty() {
+            body.push_str(" · ");
+        }
+        body.push_str(&format!("quer usar {}", e.tool));
+    }
+    crate::state::notify_text(&format!("{} está esperando você", agent), &body, "normal");
+}
+
 fn agents_json(sh: &Shared) -> Response {
     if !sh.cfg.agents {
         return Response::ok_json("{\"enabled\":false,\"processes\":[],\"sessions\":[],\"hooks\":{\"sessions\":[],\"events\":[]}}");
@@ -576,6 +709,15 @@ fn agents_json(sh: &Shared) -> Response {
             .raw("processes", &st.agents_json)
             .raw("sessions", &st.sessions_json)
             .raw("hooks", &st.hooks.to_json())
+            .raw("usage", &st.usage_json)
+            .raw(
+                "prefs",
+                &sh.prefs
+                    .read()
+                    .map(|p| p.to_json())
+                    .unwrap_or_else(|_| "{}".into()),
+            )
+            .opt_s("openclaw_note", st.openclaw_note.as_deref())
             .finish(),
     )
 }

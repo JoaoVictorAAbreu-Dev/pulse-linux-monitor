@@ -21,6 +21,36 @@ pub struct FileConfig {
     pub retention_days: Option<u64>,
     /// Pares (chave, valor) da seção [alerts], já validados.
     pub alerts: BTreeMap<String, f64>,
+    /// [agents] notify_attention: avisar no desktop quando um agente pede atenção.
+    pub notify_attention: Option<bool>,
+    /// [agents] show_tool_details: resumo das ferramentas (opt-in).
+    pub show_tool_details: Option<bool>,
+    /// [prices] modelo = "entrada, saída, leitura de cache, escrita de cache" (US$/milhão de tokens).
+    pub prices: BTreeMap<String, [f64; 4]>,
+}
+
+/// Lê "3, 15, 0.3, 3.75" ou [3, 15, 0.3, 3.75].
+pub fn parse_price(v: &str) -> Option<[f64; 4]> {
+    let v = v.trim().trim_start_matches('[').trim_end_matches(']');
+    let n: Vec<f64> = v
+        .split(',')
+        .map(|x| x.trim().trim_matches('"').parse::<f64>())
+        .collect::<Result<_, _>>()
+        .ok()?;
+    if n.len() != 4
+        || n.iter()
+            .any(|x| !x.is_finite() || *x < 0.0 || *x > 10_000.0)
+    {
+        return None;
+    }
+    Some([n[0], n[1], n[2], n[3]])
+}
+
+pub fn valid_model_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 120
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/@+".contains(c))
 }
 
 pub fn path() -> PathBuf {
@@ -79,7 +109,7 @@ pub fn parse(src: &str) -> (FileConfig, Vec<String>) {
             warn.push(format!("linha {}: esperado chave = valor", n + 1));
             continue;
         };
-        let (k, v) = (k.trim(), unquote(v));
+        let (k, v) = (unquote(k), unquote(v));
         let bad =
             |w: &mut Vec<String>| w.push(format!("linha {}: valor inválido para {}", n + 1, k));
         match (section.as_str(), k) {
@@ -106,6 +136,27 @@ pub fn parse(src: &str) -> (FileConfig, Vec<String>) {
             ("history", "retention_days") => match v.parse::<u64>() {
                 Ok(d) if (1..=MAX_RETENTION_DAYS).contains(&d) => c.retention_days = Some(d),
                 _ => bad(&mut warn),
+            },
+            ("agents", "notify_attention") | ("agents", "show_tool_details") => match v {
+                "true" | "false" => {
+                    let b = Some(v == "true");
+                    if k == "notify_attention" {
+                        c.notify_attention = b
+                    } else {
+                        c.show_tool_details = b
+                    }
+                }
+                _ => bad(&mut warn),
+            },
+            ("prices", model) => match (valid_model_key(model), parse_price(v)) {
+                (true, Some(p)) => {
+                    c.prices.insert(model.to_string(), p);
+                }
+                _ => warn.push(format!(
+                    "linha {}: preço inválido para {} (use \"entrada, saída, leitura de cache, escrita de cache\" em US$ por milhão de tokens)",
+                    n + 1,
+                    model
+                )),
             },
             ("alerts", key) if ALERT_KEYS.contains(&key) => match v.parse::<f64>() {
                 Ok(x) if x.is_finite() => {
@@ -274,6 +325,77 @@ pub fn rewrite_alerts(src: &str, r: &Rules) -> String {
     s
 }
 
+/// Reescreve uma seção `[nome]` com as linhas `chave = valor` dadas,
+/// preservando comentários e o resto do arquivo. Com `replace_all`, chaves
+/// da seção que não estão em `pairs` são removidas (ex.: preço apagado).
+pub fn rewrite_section(
+    src: &str,
+    section: &str,
+    pairs: &[(String, String)],
+    replace_all: bool,
+) -> String {
+    let key_of = |t: &str| t.split_once('=').map(|(k, _)| unquote(k).to_string());
+    let mut out: Vec<String> = Vec::new();
+    let mut inside = false;
+    let mut seen = false;
+    let mut written: Vec<String> = Vec::new();
+    let flush = |out: &mut Vec<String>, written: &Vec<String>| {
+        for (k, v) in pairs {
+            if !written.contains(k) {
+                out.push(format!("{} = {}", k, v));
+            }
+        }
+    };
+    for raw in src.lines() {
+        let t = strip_comment(raw).trim();
+        if let Some(s) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+            if inside {
+                flush(&mut out, &written);
+            }
+            inside = s.trim() == section;
+            seen |= inside;
+            out.push(raw.to_string());
+            continue;
+        }
+        if inside {
+            if let Some(k) = key_of(t) {
+                if let Some((pk, v)) = pairs.iter().find(|(pk, _)| unquote(pk) == k) {
+                    out.push(format!("{} = {}", pk, v));
+                    written.push(pk.clone());
+                    continue;
+                }
+                if replace_all {
+                    continue;
+                }
+            }
+        }
+        out.push(raw.to_string());
+    }
+    if inside {
+        flush(&mut out, &written);
+    }
+    if !seen {
+        if out.last().map(|l| !l.trim().is_empty()).unwrap_or(false) {
+            out.push(String::new());
+        }
+        out.push(format!("[{}]", section));
+        flush(&mut out, &Vec::new());
+    }
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+pub fn fmt_price(p: &[f64; 4]) -> String {
+    format!(
+        "\"{}, {}, {}, {}\"",
+        fmt_num(p[0]),
+        fmt_num(p[1]),
+        fmt_num(p[2]),
+        fmt_num(p[3])
+    )
+}
+
 /// Grava o arquivo de forma atômica (temporário + rename), modo 0600.
 pub fn write_atomic(p: &Path, body: &str) -> Result<(), String> {
     use std::io::Write;
@@ -304,6 +426,16 @@ pub const EXAMPLE: &str = "# ~/.config/pulse/config.toml — configuração do P
 
 [history]
 # retention_days = 7          # 1 a 90 dias de médias de 60 s
+
+[agents]
+# notify_attention = true     # aviso no desktop quando um agente pede atenção
+# show_tool_details = false   # resumo das ferramentas (comando, caminho) — opt-in
+
+[prices]
+# US$ por milhão de tokens: \"entrada, saída, leitura de cache, escrita de cache\".
+# Confira os preços atuais no site do provedor; o Pulse não traz preços prontos.
+# Um modelo casa pelo nome exato ou pelo prefixo mais longo.
+# \"claude-opus-5-5\" = \"0, 0, 0, 0\"
 
 [alerts]
 # cpu_pct = 90                # CPU acima disso…
@@ -370,5 +502,44 @@ mod tests {
         assert!(out2.contains("\n\n[alerts]\ncpu_pct = 90\n"));
         // exemplo comentado é válido
         assert!(parse(EXAMPLE).1.is_empty());
+    }
+
+    #[test]
+    fn agents_and_prices() {
+        let (c, w) = parse(
+            "[agents]\nnotify_attention = false\nshow_tool_details = true\n[prices]\n\"claude-opus-5-5\" = \"5, 25, 0.5, 6.25\"\nollama/qwen3:4b = [0, 0, 0, 0]\nruim = \"1, 2\"\n\"x y\" = \"1,1,1,1\"\n",
+        );
+        assert_eq!(
+            (c.notify_attention, c.show_tool_details),
+            (Some(false), Some(true))
+        );
+        assert_eq!(c.prices["claude-opus-5-5"], [5.0, 25.0, 0.5, 6.25]);
+        assert_eq!(c.prices["ollama/qwen3:4b"], [0.0; 4]);
+        assert_eq!(w.len(), 2, "{:?}", w);
+        assert_eq!(parse_price("-1,0,0,0"), None);
+    }
+
+    #[test]
+    fn rewrite_generic_section() {
+        let src = "port = 1\n\n[prices]\n# meus preços\n\"a\" = \"1, 1, 1, 1\"\n\"b\" = \"2, 2, 2, 2\"\n\n[alerts]\ncpu_pct = 80\n";
+        let pairs = vec![
+            ("\"b\"".to_string(), fmt_price(&[3.0, 4.0, 0.5, 0.0])),
+            ("\"c\"".to_string(), fmt_price(&[1.0; 4])),
+        ];
+        let out = rewrite_section(src, "prices", &pairs, true);
+        let (c, w) = parse(&out);
+        assert!(w.is_empty(), "{:?}", w);
+        assert!(!c.prices.contains_key("a"), "removido com replace_all");
+        assert_eq!(c.prices["b"], [3.0, 4.0, 0.5, 0.0]);
+        assert_eq!(c.prices["c"], [1.0; 4]);
+        assert!(out.contains("# meus preços"));
+        assert_eq!(c.alerts["cpu_pct"], 80.0);
+        let out2 = rewrite_section(
+            "port = 1\n",
+            "agents",
+            &[("notify_attention".into(), "false".into())],
+            false,
+        );
+        assert_eq!(parse(&out2).0.notify_attention, Some(false));
     }
 }

@@ -554,3 +554,114 @@ fn phase2_routes() {
         Some(60_000.0)
     );
 }
+
+#[test]
+fn phase3_agents_prefs_and_hooks() {
+    let env = Env::new("fase3");
+    // transcrição de exemplo no HOME temporário
+    let proj = env.root.join("home/.claude/projects/-tmp-x");
+    std::fs::create_dir_all(&proj).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let iso = |s: u64| {
+        let out = Command::new("date")
+            .args(["-u", "-d", &format!("@{}", s), "+%Y-%m-%dT%H:%M:%SZ"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let lines = [
+        format!(
+            r#"{{"type":"user","sessionId":"s1","cwd":"/tmp/x","timestamp":"{}","message":{{"content":"SEGREDO"}}}}"#,
+            iso(now - 60)
+        ),
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"id":"m1","model":"claude-teste-1","content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"ls --token=abc"}}}}],"usage":{{"input_tokens":1000000,"output_tokens":1000000}}}}}}"#,
+            iso(now - 50)
+        ),
+        format!(
+            r#"{{"type":"user","timestamp":"{}","message":{{"content":[{{"type":"tool_result","tool_use_id":"t1"}}]}}}}"#,
+            iso(now - 48)
+        ),
+    ];
+    std::fs::write(proj.join("s1.jsonl"), lines.join("\n")).unwrap();
+    let d = start(&env, &[]);
+    let tok = env.token();
+    let h = [("X-Pulse-Token", tok.as_str())];
+
+    // índice de uso e sessão com latência de ferramenta
+    let ok = wait_for(
+        || {
+            try_req(d.port, "GET", "/api/agents", &h, "")
+                .map(|r| r.2.contains("claude-teste-1") && r.2.contains("\"rows\":[{"))
+                .unwrap_or(false)
+        },
+        20,
+    );
+    assert!(ok, "sessão e índice de uso aparecem");
+    let (_, _, b) = req(&d, "GET", "/api/agents", &h, "");
+    assert!(
+        !b.contains("SEGREDO") && !b.contains("abc"),
+        "sem conteúdo nem detalhes por padrão"
+    );
+    let v = j(&b);
+    let s = &v.get("sessions").and_then(|x| x.as_array()).unwrap()[0];
+    let bash = &s.get("tools").and_then(|x| x.as_array()).unwrap()[0];
+    assert_eq!(bash.get("avg_ms").and_then(|x| x.as_f64()), Some(2000.0));
+
+    // preferências: preços e modo detalhado gravados no config.toml
+    let body = r#"{"show_tool_details":true,"notify_attention":false,"prices":{"claude-teste":[3,15,0.3,3.75]}}"#;
+    assert_eq!(req(&d, "POST", "/api/config/agents", &h, body).0, 200);
+    assert_eq!(
+        req(
+            &d,
+            "POST",
+            "/api/config/agents",
+            &h,
+            r#"{"prices":{"a b":[1,1,1,1]}}"#
+        )
+        .0,
+        400
+    );
+    assert_eq!(
+        req(
+            &d,
+            "POST",
+            "/api/config/agents",
+            &h,
+            r#"{"notify_attention":"sim"}"#
+        )
+        .0,
+        400
+    );
+    let cfg = std::fs::read_to_string(env.config().join("config.toml")).unwrap();
+    assert!(
+        cfg.contains("\"claude-teste\" = \"3, 15, 0.3, 3.75\"")
+            && cfg.contains("show_tool_details = true")
+    );
+
+    // hooks: subagentes/falhas e detalhe mascarado (o aviso de atenção está desligado acima)
+    let hh = |st: &'static str| {
+        [
+            ("X-Pulse-Token", tok.as_str()),
+            ("X-Pulse-State", st),
+            ("X-Pulse-Agent", "claude"),
+        ]
+    };
+    for (ev, st) in [
+        ("SubagentStart", "executando"),
+        ("PostToolUseFailure", "executando"),
+        ("PermissionRequest", "atencao"),
+    ] {
+        let b = format!(
+            r#"{{"session_id":"hk","hook_event_name":"{}","tool_name":"Bash","tool_input":{{"command":"rm x --password p4ss"}}}}"#,
+            ev
+        );
+        assert_eq!(req(&d, "POST", "/api/agents/hook", &hh(st), &b).0, 200);
+    }
+    let (_, _, b) = req(&d, "GET", "/api/agents", &h, "");
+    assert!(b.contains("\"subagents\":1") && b.contains("\"failures\":1"));
+    assert!(b.contains("rm x --password ***") && !b.contains("p4ss"));
+}

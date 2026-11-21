@@ -50,6 +50,14 @@ contra 3,5–3,6% da v0.1.0, graças ao cache de cmdline/VmSwap.
 
 ## Fase 3 — Agentes de IA (o diferencial do projeto)
 
+**Status (21/11/2026):** 3.1–3.7 implementados e validados localmente (clippy `-D warnings`, 107 testes,
+capturas sem transbordos). Com dados reais: índice de uso de 30 dias (Claude Code e 4 modelos do Codex),
+ritmo e latência das ferramentas por sessão, subagentes/falhas/pedidos de permissão via hooks, modo
+detalhado mascarando tokens e preferências gravadas no `config.toml`. Custos dependem dos preços que o
+usuário cadastra (nenhum preço vem embutido). **Não validado de ponta a ponta:** leitura do OpenClaw (falta
+o programa `sqlite3`; consulta validada no banco real por outro meio) e os novos eventos de hook vindos do
+Claude Code real (testados com payloads de exemplo).
+
 | # | Item | Esforço | Por quê / o quê |
 |---|---|---|---|
 | 3.1 | **Mais estados via hooks** | P | O `settings.json` já tem `PermissionRequest`, `SubagentStart/Stop` e `PostToolUseFailure`. Mapear: pedido de permissão → "pedindo atenção"; falha de ferramenta → selo de erro; subagentes como sessões filhas. |

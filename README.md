@@ -25,7 +25,7 @@ Baixe o `.deb` da página de Releases do GitHub (amd64 e arm64) ou gere localmen
 ```sh
 packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
 packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
-sudo apt install ./target/deb/pulse-monitor_0.2.0_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.3.0_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 ```
 
@@ -111,7 +111,10 @@ Linhas inválidas viram avisos (no log do serviço e em `GET /api/config`) e nã
    "só local" / "acessível na rede".
 8. **Logs** — journalctl (sistema/usuário), unidade, prioridade, nº de linhas, busca e "seguir".
 9. **Agentes** — processos de agentes (Claude Code, Codex, OpenClaw/"Ponto" e regras de
-   `agents.conf`), servidores MCP filhos, sessões a partir das transcrições locais e eventos ao vivo por hooks.
+   `agents.conf`), servidores MCP filhos, sessões (Claude Code, Codex e OpenClaw) com **ritmo** (tempo ativo
+   e tempo esperando você), **latência por ferramenta** e **custo estimado**, **uso diário de tokens em 30
+   dias** por agente e modelo, e eventos ao vivo por hooks (subagentes, falhas de ferramenta, pedidos de
+   permissão; Codex com "executando" inferido pela transcrição).
 10. **Alertas** — ativos, regras, histórico e status da notificação no desktop.
 
 ## API
@@ -168,8 +171,23 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
   nomes de ferramentas, tokens e linha do tempo. **O texto de pedidos, respostas e argumentos de
   ferramentas nunca sai do daemon.**
 - **Hooks**: o botão **Conectar hooks** mescla em `~/.claude/settings.json` (com backup
-  `settings.json.pulse-bak`, idempotente) chamadas a `pulse-hook` para `UserPromptSubmit`/`PreToolUse`
-  (executando), `Notification` (pedindo atenção), `Stop` (aguardando) e `SessionEnd` (concluído).
+  `settings.json.pulse-bak`, idempotente; reinstalar só acrescenta os eventos que faltam) chamadas a
+  `pulse-hook` para `UserPromptSubmit`/`PreToolUse` (executando), `PermissionRequest`/`Notification`
+  (pedindo atenção), `PostToolUseFailure` (falha de ferramenta), `SubagentStart`/`SubagentStop`
+  (subagentes), `Stop` (aguardando) e `SessionEnd` (concluído).
+- **Aviso de atenção**: quando um agente pede atenção, o Pulse avisa no desktop (`notify-send`), no máximo
+  1 vez por minuto por sessão. Desligue em **Preferências** ou com `[agents] notify_attention = false`.
+- **Custo**: cadastre preços (US$ por milhão de tokens: entrada, saída, leitura e escrita de cache) em
+  **Preferências** ou em `[prices]` no `config.toml`. O Pulse **não traz preços prontos** — confira os
+  valores atuais no site de cada provedor. Um modelo casa pelo nome exato ou pelo prefixo mais longo.
+  O uso diário vem de um índice das transcrições dos últimos 30 dias, reconstruído a cada 5 min (só
+  arquivos alterados são relidos).
+- **Modo detalhado (opt-in)**: `[agents] show_tool_details = true` mostra comando, caminho ou padrão de
+  cada ferramenta na linha do tempo e nos eventos ao vivo, com valores que parecem senhas/tokens
+  mascarados. Conteúdo de arquivos, patches e o texto das conversas continuam fora.
+- **OpenClaw**: as sessões ficam em SQLite (`~/.openclaw/agents/*/agent/openclaw-agent.sqlite`) e são lidas
+  em modo somente leitura pelo programa `sqlite3`, se instalado (`sudo apt install sqlite3`); só janela da
+  sessão, contagem de mensagens e modelo.
   **Codex**: o diálogo mostra a linha `notify = ["…/pulse-hook", "aguardando", "codex"]` para o início de
   `~/.codex/config.toml` (o Codex passa o JSON como argumento; o `pulse-hook` aceita os dois formatos).
   O Pulse não edita esse TOML sozinho. Outros agentes: `echo '{"session_id":"x"}' | pulse-hook aguardando openclaw`.
@@ -235,7 +253,9 @@ Seja honesto com o que existe:
 - **RAPL**: o consumo da CPU só aparece se `/sys/class/powercap/intel-rapl:0/energy_uj` for legível;
   em kernels recentes ele é restrito ao root. Bateria só testada com dados de exemplo (máquina desktop).
 - **Docker**: só via CLI `docker` (precisa do usuário no grupo `docker`); sem logs de contêiner nem Podman.
-- **Sessões do OpenClaw/"Ponto"**: só processos e hooks; o formato das transcrições não foi mapeado.
+- **Sessões do OpenClaw/"Ponto"**: leitura implementada via `sqlite3`, mas o programa não está instalado na
+  máquina de desenvolvimento; a consulta SQL foi validada contra os bancos reais (pelo módulo sqlite3 do
+  Python) e o parser com saídas de exemplo.
 - **Hooks do Codex/OpenClaw**: sem instalação automática (o trecho do Codex é exibido para colar).
 - Por privacidade, a tela Agentes mostra só **nomes** de ferramentas, não argumentos (o mock do Figma mostra
   comandos como `npm test`; isso foi uma decisão consciente).
