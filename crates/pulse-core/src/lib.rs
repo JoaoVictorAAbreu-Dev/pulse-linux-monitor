@@ -6,6 +6,7 @@ pub mod alerts;
 pub mod collector;
 pub mod cpu;
 pub mod disk;
+pub mod eventlog;
 pub mod history;
 pub mod json;
 pub mod longterm;

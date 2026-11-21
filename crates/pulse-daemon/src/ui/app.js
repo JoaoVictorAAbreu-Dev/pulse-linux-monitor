@@ -886,16 +886,42 @@
     try {
       const r = await api('/api/alerts');
       html('al-active', r.active.length ? r.active.map((a) => `<div class="toolbar" style="margin-bottom:10px">${sevPill(a.severity)}<b>${esc(a.title)}</b><span class="sub">${esc(a.detail)}</span><span class="sp"></span><span class="muted">desde ${esc(clock(a.since))} (${ago(a.since)})</span></div>`).join('') : '<p class="empty">Tudo certo — nenhum alerta ativo.</p>');
+      S.ruleValues = r.values;
       html('al-rules', `<table><thead><tr><th>Regra</th><th>Condição</th><th>Severidade</th></tr></thead><tbody>${r.rules.map((x) => `<tr><td><b>${esc(x.title)}</b></td><td>${esc(x.condition)}</td><td>${sevPill(x.severity)}</td></tr>`).join('')}</tbody></table>`);
-      html('al-hist', r.history.length ? `<div class="table-wrap tall"><table><thead><tr><th>Quando</th><th>Evento</th><th>Alerta</th><th>Detalhe</th></tr></thead><tbody>${r.history.map((h) => `<tr><td class="num">${esc(dateTime(h.ts))}</td><td>${h.kind === 'resolvido' ? pill('resolvido', 'ok') : h.kind === 'agravou' ? pill('agravou', 'crit') : pill('disparou', 'warn')}</td><td><b>${esc(h.alert.title)}</b></td><td>${esc(h.alert.detail)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="empty">Nenhum evento desde que o Pulse iniciou.</p>');
+      html('al-hist', r.history.length ? `<div class="table-wrap tall"><table><thead><tr><th>Quando</th><th>Evento</th><th>Alerta</th><th>Detalhe</th></tr></thead><tbody>${r.history.map((h) => `<tr><td class="num">${esc(dateTime(h.ts))}</td><td>${h.kind === 'resolvido' ? pill('resolvido', 'ok') : h.kind === 'agravou' ? pill('agravou', 'crit') : pill('disparou', 'warn')}</td><td><b>${esc(h.alert.title)}</b></td><td>${esc(h.alert.detail)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="empty">Nenhum alerta registrado ainda.</p>');
       html('al-notify', r.notify ? `${pill('ativada', 'ok')} <span class="sub">Alertas novos vão para o desktop via <code class="cmd">notify-send</code>.</span>` : `${pill('desativada')} <span class="sub">Inicie o Pulse com <code class="cmd">--notify</code> para receber notificações no desktop.</span>`);
     } catch { /* tenta de novo */ }
     if (S.page && S.page.id === 'alertas') alertsTimer = setTimeout(loadAlerts, 3000);
   }
+  const RULE_FIELDS = [
+    ['cpu_pct', 'CPU alta (%)'], ['cpu_samples', '…por N amostras'], ['mem_warn', 'Memória: aviso (%)'], ['mem_crit', 'Memória: crítico (%)'],
+    ['swap_warn', 'Swap: aviso (%)'], ['disk_warn', 'Disco: aviso (%)'], ['disk_crit', 'Disco: crítico (%)'], ['temp_crit', 'Temperatura (°C)'],
+    ['proc_pct', 'Processo preso (% CPU)'], ['proc_samples', '…por N amostras'],
+  ];
+  async function editRules() {
+    let cfg;
+    try { cfg = await api('/api/config'); } catch (e) { toast(e.message, true); return; }
+    const v = cfg.alerts;
+    const ok = await dialog({
+      title: 'Editar limiares de alerta',
+      body: `<p class="sub">Grava a seção <code class="cmd">[alerts]</code> de <code class="cmd">${esc(cfg.path)}</code> (o resto do arquivo é preservado) e vale na hora.</p>
+        <div class="grid g2" style="gap:4px 16px">${RULE_FIELDS.map(([k, l]) => `<label class="field">${esc(l)}<input class="input" type="number" step="any" data-rule="${k}" value="${esc(v[k])}"></label>`).join('')}</div>
+        ${cfg.warnings.length ? `<p class="muted">Avisos do arquivo: ${cfg.warnings.map(esc).join(' · ')}</p>` : ''}`,
+      actions: [{ label: 'Cancelar', value: null }, { label: 'Salvar', cls: 'primary', onclick: () => {
+        const out = {};
+        $$('[data-rule]').forEach((i) => { out[i.dataset.rule] = Number(i.value); });
+        closeDialog(out);
+      } }],
+    });
+    if (!ok) return;
+    try { await api('/api/config/alerts', { method: 'POST', body: ok }); toast('Limiares salvos.'); } catch (e) { toast('Não salvou: ' + e.message, true); }
+    loadAlerts();
+  }
   page('alertas', 'Alertas', 'bell', {
     mount(el) {
       el.innerHTML = `${panel('Ativos agora', '<div id="al-active"></div>')}
-        <div class="grid g-main">${card('Histórico', '<div id="al-hist"></div>')}<div class="grid" style="align-content:start">${card('Regras', '<div class="table-wrap" id="al-rules"></div>')}${card('Notificação no desktop', '<div class="toolbar" id="al-notify"></div>')}</div></div>`;
+        <div class="grid g-main">${card('Histórico', '<div id="al-hist"></div>')}<div class="grid" style="align-content:start">${card('Regras', '<div class="table-wrap" id="al-rules"></div>', '<span class="sp"></span><button class="btn sm" id="al-edit">Editar limiares</button>')}${card('Notificação no desktop', '<div class="toolbar" id="al-notify"></div>')}</div></div>`;
+      $('#al-edit').addEventListener('click', editRules);
       loadAlerts();
     },
     unmount() { clearTimeout(alertsTimer); },

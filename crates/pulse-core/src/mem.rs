@@ -30,16 +30,26 @@ impl Mem {
     }
     /// Memória de aplicativos (total − livre − cache).
     pub fn apps(&self) -> u64 {
-        self.total.saturating_sub(self.free).saturating_sub(self.cache())
+        self.total
+            .saturating_sub(self.free)
+            .saturating_sub(self.cache())
     }
     pub fn swap_used(&self) -> u64 {
         self.swap_total.saturating_sub(self.swap_free)
     }
     pub fn used_pct(&self) -> f64 {
-        if self.total == 0 { 0.0 } else { self.used() as f64 * 100.0 / self.total as f64 }
+        if self.total == 0 {
+            0.0
+        } else {
+            self.used() as f64 * 100.0 / self.total as f64
+        }
     }
     pub fn swap_pct(&self) -> f64 {
-        if self.swap_total == 0 { 0.0 } else { self.swap_used() as f64 * 100.0 / self.swap_total as f64 }
+        if self.swap_total == 0 {
+            0.0
+        } else {
+            self.swap_used() as f64 * 100.0 / self.swap_total as f64
+        }
     }
 }
 
@@ -80,7 +90,11 @@ pub fn read() -> Mem {
 pub fn parse_vmstat(src: &str, key: &str) -> Option<u64> {
     src.lines().find_map(|l| {
         let mut it = l.split_whitespace();
-        if it.next() == Some(key) { it.next()?.parse().ok() } else { None }
+        if it.next() == Some(key) {
+            it.next()?.parse().ok()
+        } else {
+            None
+        }
     })
 }
 

@@ -57,7 +57,10 @@ impl Default for Obj {
 
 impl Obj {
     pub fn new() -> Self {
-        Obj { buf: String::from("{"), first: true }
+        Obj {
+            buf: String::from("{"),
+            first: true,
+        }
     }
     fn key(&mut self, k: &str) {
         if !self.first {
@@ -291,7 +294,11 @@ fn push_quoted_plain(out: &mut String, s: &str) {
 }
 
 pub fn parse(src: &str) -> Result<Value, String> {
-    let mut p = Parser { b: src.as_bytes(), i: 0, depth: 0 };
+    let mut p = Parser {
+        b: src.as_bytes(),
+        i: 0,
+        depth: 0,
+    };
     p.ws();
     let v = p.value()?;
     p.ws();
@@ -387,10 +394,14 @@ impl Parser<'_> {
                         b't' => out.push(b'\t'),
                         b'u' => {
                             let mut cp = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&cp) && self.b[self.i..].starts_with(b"\\u") {
+                            if (0xD800..0xDC00).contains(&cp)
+                                && self.b[self.i..].starts_with(b"\\u")
+                            {
                                 self.i += 2;
                                 let lo = self.hex4()?;
-                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
+                                cp = 0x10000
+                                    + ((cp - 0xD800) << 10)
+                                    + (lo.wrapping_sub(0xDC00) & 0x3FF);
                             }
                             let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
                             let mut tmp = [0u8; 4];
@@ -464,7 +475,12 @@ mod tests {
 
     #[test]
     fn writer_escapes() {
-        let j = Obj::new().s("a", "x\"y\n</script>").n("b", 1.5).u("c", 3).b("d", true).finish();
+        let j = Obj::new()
+            .s("a", "x\"y\n</script>")
+            .n("b", 1.5)
+            .u("c", 3)
+            .b("d", true)
+            .finish();
         assert_eq!(j, r#"{"a":"x\"y\n\u003c/script>","b":1.5,"c":3,"d":true}"#);
         assert_eq!(num(f64::NAN), "null");
         assert_eq!(num(2.0), "2");

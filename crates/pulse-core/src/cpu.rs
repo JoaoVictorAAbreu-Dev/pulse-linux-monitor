@@ -16,7 +16,14 @@ pub struct Times {
 
 impl Times {
     pub fn total(&self) -> u64 {
-        self.user + self.nice + self.system + self.idle + self.iowait + self.irq + self.softirq + self.steal
+        self.user
+            + self.nice
+            + self.system
+            + self.idle
+            + self.iowait
+            + self.irq
+            + self.softirq
+            + self.steal
     }
 }
 
@@ -96,8 +103,16 @@ pub fn read_stat() -> Stat {
 
 pub fn loadavg() -> [f64; 3] {
     let s = sys::read("/proc/loadavg").unwrap_or_default();
-    let v: Vec<f64> = s.split_whitespace().take(3).filter_map(|x| x.parse().ok()).collect();
-    [v.first().copied().unwrap_or(0.0), v.get(1).copied().unwrap_or(0.0), v.get(2).copied().unwrap_or(0.0)]
+    let v: Vec<f64> = s
+        .split_whitespace()
+        .take(3)
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    [
+        v.first().copied().unwrap_or(0.0),
+        v.get(1).copied().unwrap_or(0.0),
+        v.get(2).copied().unwrap_or(0.0),
+    ]
 }
 
 /// Pressure Stall Information: (some avg10, full avg10).
@@ -110,7 +125,10 @@ pub struct Psi {
 }
 
 pub fn parse_psi(src: &str) -> Psi {
-    let mut p = Psi { available: !src.is_empty(), ..Default::default() };
+    let mut p = Psi {
+        available: !src.is_empty(),
+        ..Default::default()
+    };
     for line in src.lines() {
         let mut parts = line.split_whitespace();
         let kind = parts.next().unwrap_or("");
@@ -140,7 +158,11 @@ pub fn psi(resource: &str) -> Psi {
 }
 
 pub fn core_mhz(core: usize) -> Option<f64> {
-    sys::read_u64(&format!("/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", core)).map(|khz| khz as f64 / 1000.0)
+    sys::read_u64(&format!(
+        "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq",
+        core
+    ))
+    .map(|khz| khz as f64 / 1000.0)
 }
 
 pub fn governor() -> Option<String> {

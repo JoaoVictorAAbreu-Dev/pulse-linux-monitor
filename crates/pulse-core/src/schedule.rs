@@ -18,14 +18,25 @@ pub struct Timer {
 
 /// Saída de `systemctl list-timers -o json` (tempos em µs).
 pub fn parse_timers_json(src: &str) -> Vec<Timer> {
-    let Ok(Value::Arr(items)) = json::parse(src.trim()) else { return vec![] };
-    let us = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_f64()).map(|x| (x / 1000.0) as u64).unwrap_or(0);
+    let Ok(Value::Arr(items)) = json::parse(src.trim()) else {
+        return vec![];
+    };
+    let us = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_f64())
+            .map(|x| (x / 1000.0) as u64)
+            .unwrap_or(0)
+    };
     items
         .iter()
         .filter_map(|v| {
             Some(Timer {
                 unit: v.get("unit")?.as_str()?.to_string(),
-                activates: v.get("activates").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                activates: v
+                    .get("activates")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 next_ms: us(v, "next"),
                 last_ms: us(v, "last"),
             })
@@ -52,8 +63,22 @@ pub fn timers_json(t: &[Timer]) -> String {
         Obj::new()
             .s("unit", &x.unit)
             .s("activates", &x.activates)
-            .opt_n("next", if x.next_ms > 0 { Some(x.next_ms as f64) } else { None })
-            .opt_n("last", if x.last_ms > 0 { Some(x.last_ms as f64) } else { None })
+            .opt_n(
+                "next",
+                if x.next_ms > 0 {
+                    Some(x.next_ms as f64)
+                } else {
+                    None
+                },
+            )
+            .opt_n(
+                "last",
+                if x.last_ms > 0 {
+                    Some(x.last_ms as f64)
+                } else {
+                    None
+                },
+            )
             .finish()
     }))
 }
@@ -62,7 +87,9 @@ pub fn timers_json(t: &[Timer]) -> String {
 
 /// Mascara valores que parecem segredos (`token=...`, `--password x`...).
 pub fn redact(s: &str) -> String {
-    const KEYS: [&str; 8] = ["password", "passwd", "pass", "token", "secret", "apikey", "api_key", "key"];
+    const KEYS: [&str; 8] = [
+        "password", "passwd", "pass", "token", "secret", "apikey", "api_key", "key",
+    ];
     let mut out: Vec<String> = Vec::new();
     let mut mask_next = false;
     for w in s.split(' ') {
@@ -126,12 +153,19 @@ pub fn parse_crontab(src: &str, source: &str, system: bool, owner: &str) -> Vec<
             continue;
         }
         let schedule = parts[..nsched].join(" ");
-        let (user, cmd_start) = if system { (parts[nsched].to_string(), nsched + 1) } else { (owner.to_string(), nsched) };
+        let (user, cmd_start) = if system {
+            (parts[nsched].to_string(), nsched + 1)
+        } else {
+            (owner.to_string(), nsched)
+        };
         v.push(CronEntry {
             source: source.into(),
             schedule,
             user,
-            command: redact(&parts[cmd_start..].join(" ")).chars().take(300).collect(),
+            command: redact(&parts[cmd_start..].join(" "))
+                .chars()
+                .take(300)
+                .collect(),
         });
     }
     v
@@ -164,14 +198,24 @@ pub fn cron_json() -> String {
                 .filter(|n| !n.starts_with('.') && n != "placeholder")
                 .collect();
             names.sort();
-            periodic.push(Obj::new().s("period", p).raw("scripts", &json::arr(names.iter().map(|n| json::quote(n)))).finish());
+            periodic.push(
+                Obj::new()
+                    .s("period", p)
+                    .raw("scripts", &json::arr(names.iter().map(|n| json::quote(n))))
+                    .finish(),
+            );
         }
     }
     Obj::new()
         .raw(
             "entries",
             &json::arr(entries.iter().map(|e| {
-                Obj::new().s("source", &e.source).s("schedule", &e.schedule).s("user", &e.user).s("command", &e.command).finish()
+                Obj::new()
+                    .s("source", &e.source)
+                    .s("schedule", &e.schedule)
+                    .s("user", &e.user)
+                    .s("command", &e.command)
+                    .finish()
             })),
         )
         .raw("periodic", &json::arr(periodic))
@@ -207,7 +251,11 @@ pub fn parse_docker_ps(src: &str) -> Vec<Container> {
             let status = g("Status");
             let mut state = g("State");
             if state.is_empty() {
-                state = if status.starts_with("Up") { "running".into() } else { "exited".into() };
+                state = if status.starts_with("Up") {
+                    "running".into()
+                } else {
+                    "exited".into()
+                };
             }
             Container {
                 id: g("ID"),
@@ -230,35 +278,68 @@ pub fn parse_docker_stats(src: &str) -> Vec<(String, f64, String)> {
         .filter_map(|l| json::parse(l).ok())
         .filter_map(|v| {
             let id = v.get("ID").and_then(|x| x.as_str())?.to_string();
-            let cpu = v.get("CPUPerc").and_then(|x| x.as_str()).and_then(|s| s.trim_end_matches('%').parse().ok()).unwrap_or(0.0);
-            let mem = v.get("MemUsage").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let cpu = v
+                .get("CPUPerc")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.trim_end_matches('%').parse().ok())
+                .unwrap_or(0.0);
+            let mem = v
+                .get("MemUsage")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             Some((id, cpu, mem))
         })
         .collect()
 }
 
 pub fn containers_json(with_stats: bool) -> String {
-    let available = sys::run_cmd("docker", &["version", "--format", "{{.Server.Version}}"], 5_000);
+    let available = sys::run_cmd(
+        "docker",
+        &["version", "--format", "{{.Server.Version}}"],
+        5_000,
+    );
     let (ok, version, err) = match available {
         Ok(x) => x,
-        Err(e) => return Obj::new().b("available", false).s("error", &e).raw("containers", "[]").finish(),
+        Err(e) => {
+            return Obj::new()
+                .b("available", false)
+                .s("error", &e)
+                .raw("containers", "[]")
+                .finish()
+        }
     };
     if !ok {
         let msg = if err.contains("permission denied") {
             "sem permissão no socket do Docker (adicione o usuário ao grupo docker)".to_string()
         } else {
-            err.lines().next().unwrap_or("Docker indisponível").to_string()
+            err.lines()
+                .next()
+                .unwrap_or("Docker indisponível")
+                .to_string()
         };
-        return Obj::new().b("available", false).s("error", &msg).raw("containers", "[]").finish();
+        return Obj::new()
+            .b("available", false)
+            .s("error", &msg)
+            .raw("containers", "[]")
+            .finish();
     }
-    let list = match sys::run_cmd("docker", &["ps", "-a", "--no-trunc=false", "--format", "{{json .}}"], 10_000) {
+    let list = match sys::run_cmd(
+        "docker",
+        &["ps", "-a", "--no-trunc=false", "--format", "{{json .}}"],
+        10_000,
+    ) {
         Ok((_, out, _)) => parse_docker_ps(&out),
         Err(_) => vec![],
     };
     let stats = if with_stats && list.iter().any(|c| c.state == "running") {
-        sys::run_cmd("docker", &["stats", "--no-stream", "--format", "{{json .}}"], 15_000)
-            .map(|(_, o, _)| parse_docker_stats(&o))
-            .unwrap_or_default()
+        sys::run_cmd(
+            "docker",
+            &["stats", "--no-stream", "--format", "{{json .}}"],
+            15_000,
+        )
+        .map(|(_, o, _)| parse_docker_stats(&o))
+        .unwrap_or_default()
     } else {
         vec![]
     };
@@ -268,7 +349,9 @@ pub fn containers_json(with_stats: bool) -> String {
         .raw(
             "containers",
             &json::arr(list.iter().map(|c| {
-                let st = stats.iter().find(|s| c.id.starts_with(&s.0) || s.0.starts_with(&c.id));
+                let st = stats
+                    .iter()
+                    .find(|s| c.id.starts_with(&s.0) || s.0.starts_with(&c.id));
                 Obj::new()
                     .s("id", &c.id)
                     .s("name", &c.name)
@@ -290,7 +373,9 @@ pub fn valid_container(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && !id.starts_with('-')
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
 }
 
 pub fn container_action(verb: &str, id: &str) -> Result<String, String> {
@@ -301,7 +386,11 @@ pub fn container_action(verb: &str, id: &str) -> Result<String, String> {
         return Err("identificador de contêiner inválido".into());
     }
     let (ok, out, err) = sys::run_cmd("docker", &[verb, "--", id], 60_000)?;
-    if ok { Ok(out.trim().to_string()) } else { Err(err.trim().to_string()) }
+    if ok {
+        Ok(out.trim().to_string())
+    } else {
+        Err(err.trim().to_string())
+    }
 }
 
 #[cfg(test)]
@@ -329,7 +418,8 @@ mod tests {
         assert!(!v[0].command.contains("hunter2"));
         assert!(!v[0].command.contains("u:p@"));
         assert_eq!(v[1].command, "run.sh token=***");
-        let sys_tab = "SHELL=/bin/sh\n17 * * * * root cd / && run-parts --report /etc/cron.hourly\n";
+        let sys_tab =
+            "SHELL=/bin/sh\n17 * * * * root cd / && run-parts --report /etc/cron.hourly\n";
         let s = parse_crontab(sys_tab, "/etc/crontab", true, "");
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].user, "root");
@@ -343,7 +433,9 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].compose, "app");
         assert_eq!(c[1].state, "exited");
-        let st = parse_docker_stats("{\"ID\":\"1bad7bde7443\",\"CPUPerc\":\"1.25%\",\"MemUsage\":\"20MiB / 1GiB\"}\n");
+        let st = parse_docker_stats(
+            "{\"ID\":\"1bad7bde7443\",\"CPUPerc\":\"1.25%\",\"MemUsage\":\"20MiB / 1GiB\"}\n",
+        );
         assert_eq!(st[0].1, 1.25);
     }
 

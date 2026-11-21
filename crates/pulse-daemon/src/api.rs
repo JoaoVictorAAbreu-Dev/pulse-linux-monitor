@@ -2,6 +2,7 @@
 
 use crate::auth;
 use crate::http::{Request, Response};
+use crate::settings;
 use crate::state::{procs_json, Shared};
 use pulse_agents::hooks;
 use pulse_core::json::{self, Obj, Value};
@@ -21,18 +22,25 @@ pub enum Auth {
     Header,
 }
 
-pub fn authenticate(sh: &Shared, req: &Request) -> Auth {
+/// Resultado da autenticação e se alguma credencial (errada) foi enviada.
+pub fn authenticate(sh: &Shared, req: &Request) -> (Auth, bool) {
+    let token = sh.token();
+    let mut presented = false;
     if let Some(h) = req.header("x-pulse-token") {
-        if auth::ct_eq(h.trim().as_bytes(), sh.token.as_bytes()) {
-            return Auth::Header;
+        presented = true;
+        if auth::ct_eq(h.trim().as_bytes(), token.as_bytes()) {
+            return (Auth::Header, true);
         }
     }
     if let Some(c) = auth::cookie_value(req.header("cookie"), auth::COOKIE) {
-        if auth::ct_eq(c.as_bytes(), sh.token.as_bytes()) {
-            return Auth::Cookie;
+        if !c.is_empty() {
+            presented = true;
+            if auth::ct_eq(c.as_bytes(), token.as_bytes()) {
+                return (Auth::Cookie, true);
+            }
         }
     }
-    Auth::None
+    (Auth::None, presented)
 }
 
 /// Resultado do roteamento: resposta comum ou fluxo SSE.
@@ -42,7 +50,8 @@ pub enum Outcome {
 }
 
 fn body_json(req: &Request) -> Result<Value, Response> {
-    let s = std::str::from_utf8(&req.body).map_err(|_| Response::error(400, "corpo não é UTF-8"))?;
+    let s =
+        std::str::from_utf8(&req.body).map_err(|_| Response::error(400, "corpo não é UTF-8"))?;
     if s.trim().is_empty() {
         return Ok(Value::Obj(vec![]));
     }
@@ -61,20 +70,58 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
     if !auth::origin_ok(req.header("origin"), &sh.allowed_hosts) {
         return Outcome::Resp(Response::error(403, "Origin não permitida"));
     }
-    let a = authenticate(sh, req);
     let m = req.method.as_str();
     let p = req.path.as_str();
+    let is_public = matches!(
+        (m, p),
+        ("GET", "/")
+            | ("GET", "/index.html")
+            | ("GET", "/app.css")
+            | ("GET", "/app.js")
+            | ("GET", "/favicon.svg")
+            | ("POST", "/api/logout")
+    );
+    // Bloqueio por força bruta: IP com muitas falhas recentes não autentica.
+    if !is_public {
+        if let Some(secs) = sh.fails.blocked(peer) {
+            return Outcome::Resp(
+                Response::error(
+                    429,
+                    &format!(
+                        "muitas tentativas com token inválido; tente de novo em {} s",
+                        secs
+                    ),
+                )
+                .with_header("Retry-After", &secs.to_string()),
+            );
+        }
+    }
+    let (a, presented) = authenticate(sh, req);
+    if a != Auth::None {
+        sh.fails.success(peer);
+    } else if presented && !is_public {
+        // Atraso progressivo (até 1,5 s) e bloqueio após MAX_FAILS.
+        let n = sh.fails.count(peer);
+        std::thread::sleep(std::time::Duration::from_millis((n as u64 * 150).min(1500)));
+        if sh.fails.fail(peer) {
+            auth::audit("auth.block", peer, "IP bloqueado por falhas de token", peer);
+        }
+    }
 
     // 2) Recursos públicos: a UI estática e a saúde mínima.
     match (m, p) {
         ("GET", "/") | ("GET", "/index.html") => {
             return Outcome::Resp(Response::new(200, "text/html; charset=utf-8", INDEX_HTML))
         }
-        ("GET", "/app.css") => return Outcome::Resp(Response::new(200, "text/css; charset=utf-8", APP_CSS)),
+        ("GET", "/app.css") => {
+            return Outcome::Resp(Response::new(200, "text/css; charset=utf-8", APP_CSS))
+        }
         ("GET", "/app.js") => {
             return Outcome::Resp(Response::new(200, "text/javascript; charset=utf-8", APP_JS))
         }
-        ("GET", "/favicon.svg") => return Outcome::Resp(Response::new(200, "image/svg+xml", FAVICON)),
+        ("GET", "/favicon.svg") => {
+            return Outcome::Resp(Response::new(200, "image/svg+xml", FAVICON))
+        }
         ("GET", "/api/health") => {
             let st = sh.lock();
             let body = Obj::new()
@@ -86,25 +133,38 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
                 .u("history_points", st.ring.len() as u64)
                 .u("long_points", st.long.len() as u64)
                 .opt_s("long_error", st.long.last_error.as_deref())
+                .opt_s(
+                    "log_error",
+                    st.hook_log
+                        .last_error
+                        .as_deref()
+                        .or(st.alert_log.last_error.as_deref()),
+                )
+                .u("config_warnings", sh.config_warnings.len() as u64)
                 .finish();
             return Outcome::Resp(Response::ok_json(body));
         }
         ("POST", "/api/login") => {
             return Outcome::Resp(if a == Auth::Header {
-                Response::ok_json("{\"ok\":true}").with_header("Set-Cookie", &auth::set_cookie(&sh.token))
+                Response::ok_json("{\"ok\":true}")
+                    .with_header("Set-Cookie", &auth::set_cookie(&sh.token()))
             } else {
                 Response::error(401, "token inválido")
             });
         }
         ("POST", "/api/logout") => {
-            return Outcome::Resp(Response::ok_json("{\"ok\":true}").with_header("Set-Cookie", &auth::clear_cookie()))
+            return Outcome::Resp(
+                Response::ok_json("{\"ok\":true}").with_header("Set-Cookie", &auth::clear_cookie()),
+            )
         }
         _ => {}
     }
 
     // 3) Demais rotas: GET aceita cookie ou cabeçalho; POST exige o cabeçalho.
     match m {
-        "GET" if a == Auth::None => return Outcome::Resp(Response::error(401, "autenticação necessária")),
+        "GET" if a == Auth::None => {
+            return Outcome::Resp(Response::error(401, "autenticação necessária"))
+        }
         "POST" if a != Auth::Header => {
             return Outcome::Resp(Response::error(401, "POST exige o cabeçalho X-Pulse-Token"))
         }
@@ -118,11 +178,13 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         ("GET", "/api/history") => Response::ok_json(sh.lock().ring.to_json()),
         ("GET", "/api/history/long") => {
             let range_ms: u64 = match req.q("range").unwrap_or("24h") {
-                "1h" => 3600_000,
-                "6h" => 6 * 3600_000,
-                "24h" => 24 * 3600_000,
-                "7d" => 7 * 24 * 3600_000,
-                _ => return Outcome::Resp(Response::error(400, "range deve ser 1h, 6h, 24h ou 7d")),
+                "1h" => 3_600_000,
+                "6h" => 6 * 3_600_000,
+                "24h" => 24 * 3_600_000,
+                "7d" => 7 * 24 * 3_600_000,
+                _ => {
+                    return Outcome::Resp(Response::error(400, "range deve ser 1h, 6h, 24h ou 7d"))
+                }
             };
             let since = sys::now_ms().saturating_sub(range_ms);
             Response::ok_json(sh.lock().long.to_json(since))
@@ -138,15 +200,89 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
                     .raw("active", &st.alerts.active_json())
                     .raw("history", &st.alerts.history_json())
                     .raw("rules", &st.alerts.rules.to_json())
+                    .raw("values", &settings::rules_json(&st.alerts.rules))
                     .b("notify", sh.cfg.notify)
                     .finish(),
             )
         }
+        ("GET", "/api/config") => {
+            let st = sh.lock();
+            Response::ok_json(
+                Obj::new()
+                    .s("path", &sh.config_path.to_string_lossy())
+                    .b("exists", sh.config_path.exists())
+                    .raw(
+                        "warnings",
+                        &json::arr(sh.config_warnings.iter().map(|w| json::quote(w))),
+                    )
+                    .raw("alerts", &settings::rules_json(&st.alerts.rules))
+                    .u("port", sh.cfg.port as u64)
+                    .u("interval_ms", sh.cfg.interval_ms)
+                    .u("retention_days", sh.cfg.retention_days)
+                    .b("notify", sh.cfg.notify)
+                    .b("agents", sh.cfg.agents)
+                    .finish(),
+            )
+        }
+        ("POST", "/api/config/alerts") => match body_json(req) {
+            Err(r) => r,
+            Ok(v) => {
+                let mut kv = std::collections::BTreeMap::new();
+                if let Value::Obj(pairs) = &v {
+                    for (k, val) in pairs {
+                        match val.as_f64() {
+                            Some(x) => {
+                                kv.insert(k.clone(), x);
+                            }
+                            None => {
+                                return Outcome::Resp(Response::error(
+                                    400,
+                                    &format!("{} precisa ser número", k),
+                                ))
+                            }
+                        }
+                    }
+                }
+                let current = sh.lock().alerts.rules.clone();
+                match settings::apply_alerts(&current, &kv) {
+                    Err(e) => Response::error(400, &e),
+                    Ok(rules) => {
+                        let src = std::fs::read_to_string(&sh.config_path).unwrap_or_default();
+                        let body = settings::rewrite_alerts(&src, &rules);
+                        let res = settings::write_atomic(&sh.config_path, &body);
+                        auth::audit(
+                            "config.alerts",
+                            &sh.config_path.to_string_lossy(),
+                            res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+                            peer,
+                        );
+                        match res {
+                            Ok(()) => {
+                                sh.lock().alerts.rules = rules.clone();
+                                Response::ok_json(
+                                    Obj::new()
+                                        .b("ok", true)
+                                        .raw("alerts", &settings::rules_json(&rules))
+                                        .finish(),
+                                )
+                            }
+                            Err(e) => Response::error(
+                                500,
+                                &format!("não foi possível gravar a configuração: {}", e),
+                            ),
+                        }
+                    }
+                }
+            }
+        },
         ("GET", "/api/services") => {
             let scope = Scope::parse(req.q("scope").unwrap_or("user")).unwrap_or(Scope::User);
             match services::list(scope) {
                 Ok(u) => Response::ok_json(
-                    Obj::new().s("scope", scope.name()).raw("units", &services::list_json(&u)).finish(),
+                    Obj::new()
+                        .s("scope", scope.name())
+                        .raw("units", &services::list_json(&u))
+                        .finish(),
                 ),
                 Err(e) => Response::error(502, &e),
             }
@@ -154,12 +290,19 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         ("POST", "/api/services/action") => match body_json(req) {
             Err(r) => r,
             Ok(v) => {
-                let scope = str_field(&v, "scope").and_then(Scope::parse).unwrap_or(Scope::User);
+                let scope = str_field(&v, "scope")
+                    .and_then(Scope::parse)
+                    .unwrap_or(Scope::User);
                 let unit = str_field(&v, "unit").unwrap_or("");
                 let verb = str_field(&v, "action").unwrap_or("");
                 let res = services::action(scope, verb, unit);
                 let target = format!("{}:{}", scope.name(), unit);
-                auth::audit(&format!("service.{}", verb), &target, res.as_ref().map(|_| "ok").unwrap_or_else(|e| e), peer);
+                auth::audit(
+                    &format!("service.{}", verb),
+                    &target,
+                    res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+                    peer,
+                );
                 match res {
                     Ok(_) => Response::ok_json("{\"ok\":true}"),
                     Err(e) => Response::error(502, &e),
@@ -169,19 +312,31 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
         ("GET", "/api/timers") => {
             let scope = Scope::parse(req.q("scope").unwrap_or("user")).unwrap_or(Scope::User);
             match schedule::timers(scope) {
-                Ok(t) => Response::ok_json(Obj::new().s("scope", scope.name()).raw("timers", &schedule::timers_json(&t)).finish()),
+                Ok(t) => Response::ok_json(
+                    Obj::new()
+                        .s("scope", scope.name())
+                        .raw("timers", &schedule::timers_json(&t))
+                        .finish(),
+                ),
                 Err(e) => Response::error(502, &e),
             }
         }
         ("GET", "/api/cron") => Response::ok_json(schedule::cron_json()),
-        ("GET", "/api/containers") => Response::ok_json(schedule::containers_json(req.q("stats") == Some("1"))),
+        ("GET", "/api/containers") => {
+            Response::ok_json(schedule::containers_json(req.q("stats") == Some("1")))
+        }
         ("POST", "/api/containers/action") => match body_json(req) {
             Err(r) => r,
             Ok(v) => {
                 let id = str_field(&v, "id").unwrap_or("");
                 let verb = str_field(&v, "action").unwrap_or("");
                 let res = schedule::container_action(verb, id);
-                auth::audit(&format!("container.{}", verb), id, res.as_ref().map(|_| "ok").unwrap_or_else(|e| e), peer);
+                auth::audit(
+                    &format!("container.{}", verb),
+                    id,
+                    res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+                    peer,
+                );
                 match res {
                     Ok(_) => Response::ok_json("{\"ok\":true}"),
                     Err(e) => Response::error(502, &e),
@@ -242,7 +397,8 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
             let payload = String::from_utf8_lossy(&req.body).into_owned();
             let mut st = sh.lock();
             match st.hooks.ingest(sys::now_ms(), &agent, &state, &payload) {
-                Ok(_) => {
+                Ok(e) => {
+                    st.hook_log.append(&e.to_json());
                     drop(st);
                     sh.tick.notify_all();
                     Response::ok_json("{\"ok\":true}")
@@ -266,7 +422,10 @@ pub fn hook_script_path() -> String {
             }
         }
     }
-    sys::home().join(".local/bin/pulse-hook").to_string_lossy().into_owned()
+    sys::home()
+        .join(".local/bin/pulse-hook")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn hooks_info() -> Response {
@@ -278,11 +437,17 @@ fn hooks_info() -> Response {
             .s("settings", &settings.to_string_lossy())
             .s("script", &script)
             .b("script_exists", std::path::Path::new(&script).exists())
-            .raw("connected", &json::arr(connected.iter().map(|s| json::quote(s))))
+            .raw(
+                "connected",
+                &json::arr(connected.iter().map(|s| json::quote(s))),
+            )
             .u("total_events", hooks::CLAUDE_EVENTS.len() as u64)
             .s("snippet", &hooks::claude_snippet(&script))
             .s("codex_snippet", &hooks::codex_snippet(&script))
-            .b("codex_connected", hooks::codex_status(&sys::home().join(".codex/config.toml")))
+            .b(
+                "codex_connected",
+                hooks::codex_status(&sys::home().join(".codex/config.toml")),
+            )
             .finish(),
     )
 }
@@ -308,7 +473,9 @@ fn process_action(_sh: &Arc<Shared>, req: &Request, p: &str, peer: &str) -> Resp
     if parts.len() != 2 {
         return Response::error(404, "rota não encontrada");
     }
-    let Ok(pid) = parts[0].parse::<i32>() else { return Response::error(400, "PID inválido") };
+    let Ok(pid) = parts[0].parse::<i32>() else {
+        return Response::error(400, "PID inválido");
+    };
     let action = parts[1];
     if pid <= 1 {
         return Response::error(403, "PID protegido");
@@ -316,7 +483,9 @@ fn process_action(_sh: &Arc<Shared>, req: &Request, p: &str, peer: &str) -> Resp
     if pid == sys::self_pid() {
         return Response::error(403, "o Pulse não age sobre si mesmo");
     }
-    let Some(start) = procs::start_ticks(pid) else { return Response::error(404, "processo não encontrado") };
+    let Some(start) = procs::start_ticks(pid) else {
+        return Response::error(404, "processo não encontrado");
+    };
     let name = sys::read_trim(&format!("/proc/{}/comm", pid)).unwrap_or_default();
     let target = format!("pid={} nome={}", pid, name);
     let res: Result<String, String> = match action {
@@ -333,7 +502,12 @@ fn process_action(_sh: &Arc<Shared>, req: &Request, p: &str, peer: &str) -> Resp
                         .unwrap_or(false);
                 if alive {
                     let r = sys::send_signal(pid, sys::SIGKILL);
-                    auth::audit("process.kill", &target, r.as_ref().map(|_| "ok").unwrap_or_else(|e| e), &peer);
+                    auth::audit(
+                        "process.kill",
+                        &target,
+                        r.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+                        &peer,
+                    );
                 }
             });
             "SIGTERM enviado; SIGKILL em 5 s se não encerrar".into()
@@ -347,17 +521,28 @@ fn process_action(_sh: &Arc<Shared>, req: &Request, p: &str, peer: &str) -> Resp
                 Err(r) => return r,
             };
             match nice {
-                Some(n) if (-20.0..=19.0).contains(&n) => {
-                    sys::renice(pid, n as i32).map(|_| format!("prioridade ajustada para {}", n as i32))
-                }
+                Some(n) if (-20.0..=19.0).contains(&n) => sys::renice(pid, n as i32)
+                    .map(|_| format!("prioridade ajustada para {}", n as i32)),
                 _ => Err("nice deve estar entre -20 e 19".into()),
             }
         }
         _ => return Response::error(404, "ação desconhecida"),
     };
-    auth::audit(&format!("process.{}", action), &target, res.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e), peer);
+    auth::audit(
+        &format!("process.{}", action),
+        &target,
+        res.as_ref().map(|s| s.as_str()).unwrap_or_else(|e| e),
+        peer,
+    );
     match res {
         Ok(msg) => Response::ok_json(Obj::new().b("ok", true).s("message", &msg).finish()),
-        Err(e) => Response::error(if e.contains("ermission") || e.contains("permitida") { 403 } else { 400 }, &e),
+        Err(e) => Response::error(
+            if e.contains("ermission") || e.contains("permitida") {
+                403
+            } else {
+                400
+            },
+            &e,
+        ),
     }
 }

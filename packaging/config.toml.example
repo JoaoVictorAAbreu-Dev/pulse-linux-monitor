@@ -1,0 +1,22 @@
+# ~/.config/pulse/config.toml — configuração do Pulse
+# Flags da linha de comando têm prioridade sobre este arquivo.
+
+# port = 7878
+# interval_ms = 1000
+# notify = false
+# agents = true
+
+[history]
+# retention_days = 7          # 1 a 90 dias de médias de 60 s
+
+[alerts]
+# cpu_pct = 90                # CPU acima disso…
+# cpu_samples = 30            # …por N amostras seguidas
+# mem_warn = 90
+# mem_crit = 96
+# swap_warn = 60
+# disk_warn = 90
+# disk_crit = 97
+# temp_crit = 88              # °C
+# proc_pct = 95               # processo preso: CPU acima disso…
+# proc_samples = 300          # …por N amostras

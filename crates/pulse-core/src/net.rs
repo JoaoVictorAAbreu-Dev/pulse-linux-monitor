@@ -20,8 +20,13 @@ pub struct IfCounters {
 pub fn parse_net_dev(src: &str) -> Vec<(String, IfCounters)> {
     let mut v = Vec::new();
     for line in src.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else { continue };
-        let n: Vec<u64> = rest.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let n: Vec<u64> = rest
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
         if n.len() < 16 {
             continue;
         }
@@ -78,19 +83,26 @@ impl IfInfo {
     }
 }
 
-pub fn iface_info(prev: &[(String, IfCounters)], cur: &[(String, IfCounters)], dt_s: f64) -> Vec<IfInfo> {
+pub fn iface_info(
+    prev: &[(String, IfCounters)],
+    cur: &[(String, IfCounters)],
+    dt_s: f64,
+) -> Vec<IfInfo> {
     let pm: HashMap<&str, &IfCounters> = prev.iter().map(|(n, c)| (n.as_str(), c)).collect();
     cur.iter()
         .map(|(name, c)| {
             let p = pm.get(name.as_str()).copied().copied().unwrap_or(*c);
             let base = format!("/sys/class/net/{}", name);
-            let speed = sys::read_trim(&format!("{}/speed", base)).and_then(|s| s.parse::<i64>().ok()).filter(|s| *s > 0);
+            let speed = sys::read_trim(&format!("{}/speed", base))
+                .and_then(|s| s.parse::<i64>().ok())
+                .filter(|s| *s > 0);
             let virtual_if = std::fs::read_link(&base)
                 .map(|t| t.to_string_lossy().contains("/virtual/"))
                 .unwrap_or(name == "lo");
             IfInfo {
                 name: name.clone(),
-                state: sys::read_trim(&format!("{}/operstate", base)).unwrap_or_else(|| "unknown".into()),
+                state: sys::read_trim(&format!("{}/operstate", base))
+                    .unwrap_or_else(|| "unknown".into()),
                 speed_mbps: speed,
                 mac: sys::read_trim(&format!("{}/address", base)).unwrap_or_default(),
                 mtu: sys::read_u64(&format!("{}/mtu", base)).unwrap_or(0),
@@ -104,8 +116,18 @@ pub fn iface_info(prev: &[(String, IfCounters)], cur: &[(String, IfCounters)], d
 }
 
 pub const TCP_STATES: [&str; 12] = [
-    "?", "ESTABLISHED", "SYN_SENT", "SYN_RECV", "FIN_WAIT1", "FIN_WAIT2", "TIME_WAIT", "CLOSE", "CLOSE_WAIT",
-    "LAST_ACK", "LISTEN", "CLOSING",
+    "?",
+    "ESTABLISHED",
+    "SYN_SENT",
+    "SYN_RECV",
+    "FIN_WAIT1",
+    "FIN_WAIT2",
+    "TIME_WAIT",
+    "CLOSE",
+    "CLOSE_WAIT",
+    "LAST_ACK",
+    "LISTEN",
+    "CLOSING",
 ];
 
 #[derive(Debug, Clone)]
@@ -135,7 +157,11 @@ fn parse_addr(hex: &str, v6: bool) -> Option<(String, u16, bool)> {
         bytes[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
     }
     let ip = Ipv6Addr::from(bytes);
-    let loop_ = ip.is_loopback() || ip.to_ipv4_mapped().map(|x| x.is_loopback()).unwrap_or(false);
+    let loop_ = ip.is_loopback()
+        || ip
+            .to_ipv4_mapped()
+            .map(|x| x.is_loopback())
+            .unwrap_or(false);
     Some((ip.to_string(), port, loop_))
 }
 
@@ -147,10 +173,19 @@ pub fn parse_proc_net(src: &str, proto: &'static str) -> Vec<Sock> {
         if f.len() < 10 {
             continue;
         }
-        let Some((local, port, loopback)) = parse_addr(f[1], v6) else { continue };
+        let Some((local, port, loopback)) = parse_addr(f[1], v6) else {
+            continue;
+        };
         let state = u8::from_str_radix(f[3], 16).unwrap_or(0);
         let inode = f[9].parse().unwrap_or(0);
-        v.push(Sock { proto, local, port, state, inode, loopback });
+        v.push(Sock {
+            proto,
+            local,
+            port,
+            state,
+            inode,
+            loopback,
+        });
     }
     v
 }
@@ -159,7 +194,10 @@ pub fn read_sockets() -> Vec<Sock> {
     let mut v = Vec::new();
     for p in ["tcp", "tcp6", "udp", "udp6"] {
         let proto: &'static str = p;
-        v.extend(parse_proc_net(&sys::read(&format!("/proc/net/{}", p)).unwrap_or_default(), proto));
+        v.extend(parse_proc_net(
+            &sys::read(&format!("/proc/net/{}", p)).unwrap_or_default(),
+            proto,
+        ));
     }
     v
 }
@@ -172,23 +210,39 @@ pub fn tcp_state_counts(socks: &[Sock]) -> Vec<(&'static str, u64)> {
             counts[s.state as usize] += 1;
         }
     }
-    TCP_STATES.iter().enumerate().skip(1).map(|(i, n)| (*n, counts[i])).filter(|(_, c)| *c > 0).collect()
+    TCP_STATES
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(i, n)| (*n, counts[i]))
+        .filter(|(_, c)| *c > 0)
+        .collect()
 }
 
 /// Mapa inode de socket → (pid, nome) varrendo /proc/*/fd (só processos legíveis).
 pub fn socket_owners() -> HashMap<u64, (i32, String)> {
     let mut m = HashMap::new();
-    let Ok(rd) = std::fs::read_dir("/proc") else { return m };
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return m;
+    };
     for e in rd.flatten() {
-        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-        let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else { continue };
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(format!("/proc/{}/fd", pid)) else {
+            continue;
+        };
         let mut name: Option<String> = None;
         for fd in fds.flatten() {
-            let Ok(t) = std::fs::read_link(fd.path()) else { continue };
+            let Ok(t) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
             let t = t.to_string_lossy();
             if let Some(n) = t.strip_prefix("socket:[").and_then(|x| x.strip_suffix(']')) {
                 if let Ok(ino) = n.parse::<u64>() {
-                    let nm = name.get_or_insert_with(|| sys::read_trim(&format!("/proc/{}/comm", pid)).unwrap_or_default());
+                    let nm = name.get_or_insert_with(|| {
+                        sys::read_trim(&format!("/proc/{}/comm", pid)).unwrap_or_default()
+                    });
                     m.insert(ino, (pid, nm.clone()));
                 }
             }
@@ -202,7 +256,10 @@ pub fn listening_json(socks: &[Sock], owners: &HashMap<u64, (i32, String)>) -> S
     let mut seen = std::collections::HashSet::new();
     let mut items: Vec<&Sock> = socks
         .iter()
-        .filter(|s| (s.proto.starts_with("tcp") && s.state == 10) || (s.proto.starts_with("udp") && s.state == 7))
+        .filter(|s| {
+            (s.proto.starts_with("tcp") && s.state == 10)
+                || (s.proto.starts_with("udp") && s.state == 7)
+        })
         .filter(|s| seen.insert((s.proto, s.local.clone(), s.port)))
         .collect();
     items.sort_by_key(|s| (s.port, s.proto));

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if [ "$1" = "purge" ]; then
+  # Os dados ficam no HOME de cada usuário (~/.config/pulse, ~/.local/state/pulse)
+  # e não são apagados pelo pacote.
+  echo "pulse-monitor removido. Dados de usuário em ~/.config/pulse e ~/.local/state/pulse foram mantidos."
+fi
+exit 0

@@ -77,18 +77,29 @@ pub fn cmdline(pid: i32) -> String {
         Ok(b) => {
             let s: String = String::from_utf8_lossy(&b).replace('\0', " ");
             let s = s.trim().to_string();
-            if s.len() > 600 { format!("{}…", &s[..s.char_indices().nth(600).map(|x| x.0).unwrap_or(s.len())]) } else { s }
+            if s.len() > 600 {
+                format!(
+                    "{}…",
+                    &s[..s.char_indices().nth(600).map(|x| x.0).unwrap_or(s.len())]
+                )
+            } else {
+                s
+            }
         }
         Err(_) => String::new(),
     }
 }
 
 pub fn cwd(pid: i32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{}/cwd", pid)).ok().map(|p| p.to_string_lossy().into_owned())
+    std::fs::read_link(format!("/proc/{}/cwd", pid))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 pub fn exe(pid: i32) -> Option<String> {
-    std::fs::read_link(format!("/proc/{}/exe", pid)).ok().map(|p| p.to_string_lossy().into_owned())
+    std::fs::read_link(format!("/proc/{}/exe", pid))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Lê starttime de um PID (para evitar agir sobre PID reutilizado).
@@ -132,10 +143,18 @@ impl Sampler {
         }
         let mut out = Vec::new();
         let mut next = HashMap::new();
-        let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+        let Ok(rd) = std::fs::read_dir("/proc") else {
+            return out;
+        };
         for e in rd.flatten() {
-            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
-            let Some(st) = sys::read(&format!("/proc/{}/stat", pid)).and_then(|s| parse_pid_stat(&s)) else { continue };
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else {
+                continue;
+            };
+            let Some(st) =
+                sys::read(&format!("/proc/{}/stat", pid)).and_then(|s| parse_pid_stat(&s))
+            else {
+                continue;
+            };
             let uid = e.metadata().map(|m| m.uid()).unwrap_or(0);
             let cpu = match self.prev.get(&pid) {
                 Some((t, start)) if *start == st.start_ticks => {
@@ -148,11 +167,19 @@ impl Sampler {
             out.push(Proc {
                 pid,
                 ppid: st.ppid,
-                cmd: if cmd.is_empty() { format!("[{}]", st.name) } else { cmd },
+                cmd: if cmd.is_empty() {
+                    format!("[{}]", st.name)
+                } else {
+                    cmd
+                },
                 name: st.name,
                 state: st.state,
                 uid,
-                user: self.users.get(&uid).cloned().unwrap_or_else(|| uid.to_string()),
+                user: self
+                    .users
+                    .get(&uid)
+                    .cloned()
+                    .unwrap_or_else(|| uid.to_string()),
                 cpu,
                 rss: st.rss_pages * self.page,
                 threads: st.threads,
@@ -178,7 +205,10 @@ pub struct Summary {
 }
 
 pub fn summarize(list: &[Proc]) -> Summary {
-    let mut s = Summary { total: list.len() as u64, ..Default::default() };
+    let mut s = Summary {
+        total: list.len() as u64,
+        ..Default::default()
+    };
     for p in list {
         s.threads += p.threads;
         match p.state {
@@ -210,14 +240,19 @@ pub fn list_json(list: &[Proc]) -> String {
 /// Maiores consumidores ordenados por CPU e depois memória.
 pub fn top(list: &[Proc], n: usize) -> Vec<Proc> {
     let mut v: Vec<Proc> = list.iter().filter(|p| p.rss > 0).cloned().collect();
-    v.sort_by(|a, b| b.cpu.partial_cmp(&a.cpu).unwrap_or(std::cmp::Ordering::Equal).then(b.rss.cmp(&a.rss)));
+    v.sort_by(|a, b| {
+        b.cpu
+            .partial_cmp(&a.cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.rss.cmp(&a.rss))
+    });
     v.truncate(n);
     v
 }
 
 pub fn top_mem(list: &[Proc], n: usize) -> Vec<Proc> {
     let mut v: Vec<Proc> = list.to_vec();
-    v.sort_by(|a, b| b.rss.cmp(&a.rss));
+    v.sort_by_key(|p| std::cmp::Reverse(p.rss));
     v.truncate(n);
     v
 }

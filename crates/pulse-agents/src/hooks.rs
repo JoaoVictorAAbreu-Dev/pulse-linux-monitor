@@ -41,6 +41,22 @@ pub struct HookEvent {
 }
 
 impl HookEvent {
+    /// Reconstrói um evento persistido; `None` se a linha for inválida.
+    pub fn from_json(line: &str) -> Option<HookEvent> {
+        let v = json::parse(line).ok()?;
+        let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        Some(HookEvent {
+            ts: v.get("ts")?.as_f64()? as u64,
+            agent: clean(&g("agent"), 40),
+            state: normalize_state(v.get("state")?.as_str()?)?,
+            session: clean(v.get("session")?.as_str()?, 80),
+            cwd: clean(&g("cwd"), 300),
+            event: clean(&g("event"), 40),
+            tool: clean(&g("tool"), 60),
+            message: clean(&g("message"), 200),
+        })
+    }
+
     pub fn to_json(&self) -> String {
         Obj::new()
             .u("ts", self.ts)
@@ -65,13 +81,27 @@ pub struct HookStore {
 impl HookStore {
     /// Registra um evento. `payload` é o JSON que o agente passou ao hook
     /// (só alguns campos são extraídos; o resto é descartado).
-    pub fn ingest(&mut self, ts: u64, agent: &str, state: &str, payload: &str) -> Result<HookEvent, String> {
+    pub fn ingest(
+        &mut self,
+        ts: u64,
+        agent: &str,
+        state: &str,
+        payload: &str,
+    ) -> Result<HookEvent, String> {
         let state = normalize_state(state).ok_or("estado inválido")?;
-        let v = if payload.trim().is_empty() { Value::Obj(vec![]) } else { json::parse(payload).unwrap_or(Value::Obj(vec![])) };
+        let v = if payload.trim().is_empty() {
+            Value::Obj(vec![])
+        } else {
+            json::parse(payload).unwrap_or(Value::Obj(vec![]))
+        };
         let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let agent = {
             let a = clean(agent, 40);
-            if a.is_empty() { "claude".to_string() } else { a }
+            if a.is_empty() {
+                "claude".to_string()
+            } else {
+                a
+            }
         };
         let session = {
             // Claude Code usa session_id; o notify do Codex usa thread-id.
@@ -82,7 +112,11 @@ impl HookStore {
             if s.is_empty() {
                 s = g("thread_id");
             }
-            if s.is_empty() { format!("{}-sem-sessao", agent) } else { clean(&s, 80) }
+            if s.is_empty() {
+                format!("{}-sem-sessao", agent)
+            } else {
+                clean(&s, 80)
+            }
         };
         let e = HookEvent {
             ts,
@@ -90,34 +124,62 @@ impl HookStore {
             state,
             session: session.clone(),
             cwd: clean(&g("cwd"), 300),
-            event: clean(&{
-                let e = g("hook_event_name");
-                if e.is_empty() { g("type") } else { e }
-            }, 40),
+            event: clean(
+                &{
+                    let e = g("hook_event_name");
+                    if e.is_empty() {
+                        g("type")
+                    } else {
+                        e
+                    }
+                },
+                40,
+            ),
             tool: clean(&g("tool_name"), 60),
             message: clean(&g("message"), 200),
         };
-        if self.events.len() >= 300 {
-            self.events.pop_front();
-        }
-        self.events.push_back(e.clone());
-        self.sessions.insert(session, e.clone());
-        if self.sessions.len() > 100 {
-            if let Some(oldest) = self.sessions.iter().min_by_key(|(_, e)| e.ts).map(|(k, _)| k.clone()) {
-                self.sessions.remove(&oldest);
-            }
-        }
+        self.remember(e.clone());
         self.received += 1;
         Ok(e)
     }
 
+    fn remember(&mut self, e: HookEvent) {
+        if self.events.len() >= 300 {
+            self.events.pop_front();
+        }
+        self.events.push_back(e.clone());
+        self.sessions.insert(e.session.clone(), e);
+        if self.sessions.len() > 100 {
+            if let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, e)| e.ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+    }
+
+    /// Recarrega eventos persistidos (linhas de `HookEvent::to_json`).
+    pub fn restore<'a>(&mut self, lines: impl Iterator<Item = &'a str>) {
+        for l in lines {
+            if let Some(e) = HookEvent::from_json(l) {
+                self.remember(e);
+            }
+        }
+    }
+
     pub fn to_json(&self) -> String {
         let mut s: Vec<&HookEvent> = self.sessions.values().collect();
-        s.sort_by(|a, b| b.ts.cmp(&a.ts));
+        s.sort_by_key(|e| std::cmp::Reverse(e.ts));
         Obj::new()
             .u("received", self.received)
             .raw("sessions", &json::arr(s.into_iter().map(|e| e.to_json())))
-            .raw("events", &json::arr(self.events.iter().rev().take(100).map(|e| e.to_json())))
+            .raw(
+                "events",
+                &json::arr(self.events.iter().rev().take(100).map(|e| e.to_json())),
+            )
             .finish()
     }
 }
@@ -159,16 +221,24 @@ pub fn claude_snippet(script: &str) -> String {
 /// Mescla os hooks do Pulse em `settings.json`, preservando o restante.
 /// Idempotente: eventos que já chamam `pulse-hook` não são duplicados.
 /// Retorna (eventos adicionados, caminho do backup se houve).
-pub fn install_claude(settings: &Path, script: &str) -> Result<(Vec<String>, Option<String>), String> {
+pub fn install_claude(
+    settings: &Path,
+    script: &str,
+) -> Result<(Vec<String>, Option<String>), String> {
     let existing = match std::fs::read_to_string(settings) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("não foi possível ler {}: {}", settings.display(), e)),
+        Err(e) => {
+            return Err(format!(
+                "não foi possível ler {}: {}",
+                settings.display(),
+                e
+            ))
+        }
     };
     let mut root = match &existing {
-        Some(s) if !s.trim().is_empty() => {
-            json::parse(s).map_err(|e| format!("settings.json inválido, nada foi alterado: {}", e))?
-        }
+        Some(s) if !s.trim().is_empty() => json::parse(s)
+            .map_err(|e| format!("settings.json inválido, nada foi alterado: {}", e))?,
         _ => Value::Obj(vec![]),
     };
     if !matches!(root, Value::Obj(_)) {
@@ -184,7 +254,12 @@ pub fn install_claude(settings: &Path, script: &str) -> Result<(Vec<String>, Opt
     }
     let mut added = Vec::new();
     for (ev, _, _) in CLAUDE_EVENTS {
-        let ours = snippet.path(&["hooks", ev]).and_then(|x| x.as_array()).and_then(|a| a.first()).cloned().unwrap();
+        let ours = snippet
+            .path(&["hooks", ev])
+            .and_then(|x| x.as_array())
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap();
         match hooks.get_mut(ev) {
             Some(Value::Arr(list)) => {
                 if list.iter().any(|x| x.to_json().contains("pulse-hook")) {
@@ -192,7 +267,12 @@ pub fn install_claude(settings: &Path, script: &str) -> Result<(Vec<String>, Opt
                 }
                 list.push(ours);
             }
-            Some(_) => return Err(format!("hooks.{} tem formato inesperado; nada foi alterado", ev)),
+            Some(_) => {
+                return Err(format!(
+                    "hooks.{} tem formato inesperado; nada foi alterado",
+                    ev
+                ))
+            }
             None => hooks.set(ev, Value::Arr(vec![ours])),
         }
         added.push(ev.to_string());
@@ -218,23 +298,37 @@ pub fn install_claude(settings: &Path, script: &str) -> Result<(Vec<String>, Opt
 /// Linha para `~/.codex/config.toml` (chave de nível superior, antes de
 /// qualquer `[tabela]`). O Codex passa o JSON do evento como último argumento.
 pub fn codex_snippet(script: &str) -> String {
-    format!("notify = [\"{}\", \"aguardando\", \"codex\"]", script.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "notify = [\"{}\", \"aguardando\", \"codex\"]",
+        script.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 /// `notify` do Codex já aponta para o pulse-hook?
 pub fn codex_status(config: &Path) -> bool {
     std::fs::read_to_string(config)
-        .map(|s| s.lines().any(|l| l.trim_start().starts_with("notify") && l.contains("pulse-hook")))
+        .map(|s| {
+            s.lines()
+                .any(|l| l.trim_start().starts_with("notify") && l.contains("pulse-hook"))
+        })
         .unwrap_or(false)
 }
 
 /// Quais eventos do Claude Code já chamam o pulse-hook.
 pub fn claude_status(settings: &Path) -> Vec<String> {
-    let Ok(s) = std::fs::read_to_string(settings) else { return vec![] };
-    let Ok(v) = json::parse(&s) else { return vec![] };
+    let Ok(s) = std::fs::read_to_string(settings) else {
+        return vec![];
+    };
+    let Ok(v) = json::parse(&s) else {
+        return vec![];
+    };
     CLAUDE_EVENTS
         .iter()
-        .filter(|(ev, _, _)| v.path(&["hooks", ev]).map(|x| x.to_json().contains("pulse-hook")).unwrap_or(false))
+        .filter(|(ev, _, _)| {
+            v.path(&["hooks", ev])
+                .map(|x| x.to_json().contains("pulse-hook"))
+                .unwrap_or(false)
+        })
         .map(|(ev, _, _)| ev.to_string())
         .collect()
 }
@@ -255,10 +349,27 @@ mod tests {
         assert!(h.ingest(6, "claude", "xyz", "{}").is_err());
         h.ingest(7, "codex", "done", "lixo").unwrap();
         let c = h.ingest(8, "codex", "aguardando", r#"{"type":"agent-turn-complete","thread-id":"t9","last-assistant-message":"texto privado"}"#).unwrap();
-        assert_eq!((c.session.as_str(), c.event.as_str()), ("t9", "agent-turn-complete"));
+        assert_eq!(
+            (c.session.as_str(), c.event.as_str()),
+            ("t9", "agent-turn-complete")
+        );
         assert!(!h.to_json().contains("texto privado"));
-        assert_eq!(codex_snippet("/x/pulse-hook"), r#"notify = ["/x/pulse-hook", "aguardando", "codex"]"#);
+        assert_eq!(
+            codex_snippet("/x/pulse-hook"),
+            r#"notify = ["/x/pulse-hook", "aguardando", "codex"]"#
+        );
         assert_eq!(h.sessions.len(), 3);
+        let lines: Vec<String> = h.events.iter().map(|e| e.to_json()).collect();
+        let mut r = HookStore::default();
+        r.restore(
+            lines
+                .iter()
+                .map(|s| s.as_str())
+                .chain(["lixo", r#"{"ts":1,"state":"xyz","session":"a"}"#]),
+        );
+        assert_eq!(r.events.len(), h.events.len());
+        assert_eq!(r.sessions.len(), 3);
+        assert_eq!(r.sessions["t9"].state, "aguardando");
     }
 
     #[test]
@@ -278,7 +389,15 @@ mod tests {
         let v = json::parse(&std::fs::read_to_string(&f).unwrap()).unwrap();
         assert_eq!(v.get("model").unwrap().as_str(), Some("opus"));
         assert!(v.to_json().contains("1.50"));
-        assert_eq!(v.path(&["hooks", "Stop"]).unwrap().as_array().unwrap().len(), 2, "hook existente preservado");
+        assert_eq!(
+            v.path(&["hooks", "Stop"])
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "hook existente preservado"
+        );
         assert_eq!(claude_status(&f).len(), 5);
         let (again, b2) = install_claude(&f, "/opt/pulse/pulse-hook").unwrap();
         assert!(again.is_empty() && b2.is_none());

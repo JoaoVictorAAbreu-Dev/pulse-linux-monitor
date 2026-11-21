@@ -55,7 +55,14 @@ pub fn parse_list_units(src: &str) -> Vec<Unit> {
             let active = it.next()?.to_string();
             let sub = it.next()?.to_string();
             let description = it.collect::<Vec<_>>().join(" ");
-            Some(Unit { name, load, active, sub, description, enabled: String::new() })
+            Some(Unit {
+                name,
+                load,
+                active,
+                sub,
+                description,
+                enabled: String::new(),
+            })
         })
         .collect()
 }
@@ -118,7 +125,9 @@ pub fn valid_unit(name: &str) -> bool {
         && name.len() <= 200
         && !name.starts_with('-')
         && name.ends_with(".service")
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || "@._:-\\".contains(c))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._:-\\".contains(c))
 }
 
 pub fn action(scope: Scope, verb: &str, unit: &str) -> Result<String, String> {
@@ -139,7 +148,11 @@ pub fn action(scope: Scope, verb: &str, unit: &str) -> Result<String, String> {
     if ok {
         Ok(out.trim().to_string())
     } else {
-        Err(if err.trim().is_empty() { "systemctl falhou".into() } else { err.trim().to_string() })
+        Err(if err.trim().is_empty() {
+            "systemctl falhou".into()
+        } else {
+            err.trim().to_string()
+        })
     }
 }
 
@@ -160,7 +173,11 @@ fn field_str(v: &Value, key: &str) -> String {
         Some(Value::Num(n)) => n.clone(),
         Some(Value::Arr(bytes)) => {
             // journald entrega mensagens binárias como array de bytes.
-            let b: Vec<u8> = bytes.iter().filter_map(|x| x.as_f64()).map(|x| x as u8).collect();
+            let b: Vec<u8> = bytes
+                .iter()
+                .filter_map(|x| x.as_f64())
+                .map(|x| x as u8)
+                .collect();
             String::from_utf8_lossy(&b).into_owned()
         }
         _ => String::new(),
@@ -183,7 +200,11 @@ pub fn parse_journal_json(src: &str) -> Vec<LogLine> {
         .map(|v| {
             let unit = {
                 let u = field_str(&v, "_SYSTEMD_USER_UNIT");
-                if u.is_empty() { field_str(&v, "_SYSTEMD_UNIT") } else { u }
+                if u.is_empty() {
+                    field_str(&v, "_SYSTEMD_UNIT")
+                } else {
+                    u
+                }
             };
             LogLine {
                 ts_us: field_str(&v, "__REALTIME_TIMESTAMP").parse().unwrap_or(0),
@@ -204,10 +225,20 @@ pub fn query_logs(q: &LogQuery) -> Result<String, String> {
     if let Some(f) = q.scope.flag() {
         args.push(f.into());
     }
-    args.extend(["--no-pager".into(), "-o".into(), "json".into(), "-n".into(), lines]);
+    args.extend([
+        "--no-pager".into(),
+        "-o".into(),
+        "json".into(),
+        "-n".into(),
+        lines,
+    ]);
     if let Some(u) = &q.unit {
         if !u.is_empty() {
-            if !u.chars().all(|c| c.is_ascii_alphanumeric() || "@._:-\\*".contains(c)) || u.starts_with('-') {
+            if !u
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "@._:-\\*".contains(c))
+                || u.starts_with('-')
+            {
                 return Err("unidade inválida".into());
             }
             args.push(format!("--unit={}", u));
@@ -224,16 +255,26 @@ pub fn query_logs(q: &LogQuery) -> Result<String, String> {
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let (_ok, out, err) = sys::run_cmd("journalctl", &refs, 15_000)?;
     let mut entries = parse_journal_json(&out);
-    let last_cursor = entries.last().map(|e| e.cursor.clone()).or_else(|| q.after_cursor.clone()).unwrap_or_default();
+    let last_cursor = entries
+        .last()
+        .map(|e| e.cursor.clone())
+        .or_else(|| q.after_cursor.clone())
+        .unwrap_or_default();
     if let Some(g) = &q.grep {
         let g = g.to_lowercase();
         if !g.is_empty() {
             entries.retain(|e| {
-                e.message.to_lowercase().contains(&g) || e.unit.to_lowercase().contains(&g) || e.ident.to_lowercase().contains(&g)
+                e.message.to_lowercase().contains(&g)
+                    || e.unit.to_lowercase().contains(&g)
+                    || e.ident.to_lowercase().contains(&g)
             });
         }
     }
-    let note = if out.trim().is_empty() && !err.trim().is_empty() { err.trim().to_string() } else { String::new() };
+    let note = if out.trim().is_empty() && !err.trim().is_empty() {
+        err.trim().to_string()
+    } else {
+        String::new()
+    };
     Ok(Obj::new()
         .s("cursor", &last_cursor)
         .s("note", &note)
@@ -262,7 +303,10 @@ mod tests {
         let src = "cron.service loaded active running Regular background program processing daemon\n● bad.service loaded failed failed Bad thing\nfoo.socket loaded active listening x\n";
         let u = parse_list_units(src);
         assert_eq!(u.len(), 2);
-        assert_eq!(u[0].description, "Regular background program processing daemon");
+        assert_eq!(
+            u[0].description,
+            "Regular background program processing daemon"
+        );
         assert_eq!(u[1].name, "bad.service");
         assert_eq!(u[1].active, "failed");
     }

@@ -57,7 +57,10 @@ pub struct Ring {
 
 impl Ring {
     pub fn new(cap: usize) -> Self {
-        Ring { cap, items: VecDeque::with_capacity(cap) }
+        Ring {
+            cap,
+            items: VecDeque::with_capacity(cap),
+        }
     }
     pub fn push(&mut self, p: Point) {
         if self.items.len() == self.cap {
@@ -84,7 +87,10 @@ mod tests {
     fn ring_caps() {
         let mut r = Ring::new(3);
         for i in 0..5 {
-            r.push(Point { ts: i, ..Default::default() });
+            r.push(Point {
+                ts: i,
+                ..Default::default()
+            });
         }
         assert_eq!(r.len(), 3);
         assert_eq!(r.items.front().unwrap().ts, 2);
@@ -94,7 +100,10 @@ mod tests {
 
     #[test]
     fn nan_temp_is_null() {
-        let p = Point { temp: f64::NAN, ..Default::default() };
+        let p = Point {
+            temp: f64::NAN,
+            ..Default::default()
+        };
         assert!(p.to_json().contains("\"temp\":null"));
     }
 }

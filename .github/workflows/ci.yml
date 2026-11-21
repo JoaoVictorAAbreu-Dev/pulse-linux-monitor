@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy e testes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatação
+        run: cargo fmt --all -- --check
+      - name: Clippy (warnings são erros)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Testes (unitários e integração)
+        run: cargo test --all
+      - name: Sintaxe da UI e dos scripts
+        run: |
+          node --check crates/pulse-daemon/src/ui/app.js
+          for f in install.sh packaging/pulse-hook packaging/build-deb.sh packaging/deb/pulse-open packaging/deb/postinst packaging/deb/postrm; do sh -n "$f"; done
+          bash -n packaging/deb/pulse.bash-completion
+
+  deb:
+    name: pacote .deb (${{ matrix.arch }})
+    needs: check
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Ferramentas
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lintian fakeroot
+          if [ "${{ matrix.arch }}" = arm64 ]; then sudo apt-get install -y -qq gcc-aarch64-linux-gnu; fi
+      - name: Versão da tag confere com o Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$v" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} ≠ versão v$v"; exit 1; }
+      - name: Compilar e empacotar
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: packaging/build-deb.sh --target ${{ matrix.target }}
+      - name: Lintian
+        run: lintian --fail-on warning --tag-display-limit 0 target/deb/*.deb
+      - name: Instalar e remover (amd64)
+        if: matrix.arch == 'amd64'
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends ./target/deb/pulse-monitor_*_amd64.deb
+          pulse --once | head -c 200
+          pulse --help | head -3
+          sudo apt-get purge -y -qq pulse-monitor
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pulse-monitor-${{ matrix.arch }}
+          path: target/deb/*.deb
+          if-no-files-found: error
+
+  release:
+    name: publicar release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: deb
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Criar release com os .deb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          (cd dist && sha256sum *.deb > SHA256SUMS)
+          gh release create "${GITHUB_REF_NAME}" dist/*.deb dist/SHA256SUMS \
+            --repo "${GITHUB_REPOSITORY}" --title "Pulse ${GITHUB_REF_NAME}" --generate-notes

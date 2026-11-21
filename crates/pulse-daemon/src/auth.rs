@@ -56,10 +56,111 @@ pub fn load_or_create_token(path: &Path) -> Result<String, String> {
         .mode(0o600)
         .open(&tmp)
         .map_err(|e| format!("gravar token: {}", e))?;
-    f.write_all(token.as_bytes()).and_then(|_| f.write_all(b"\n")).map_err(|e| e.to_string())?;
+    f.write_all(token.as_bytes())
+        .and_then(|_| f.write_all(b"\n"))
+        .map_err(|e| e.to_string())?;
     drop(f);
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     Ok(token)
+}
+
+/// Gera e grava um token novo (mesmas permissões), substituindo o anterior.
+/// O daemon em execução percebe a troca pelo mtime do arquivo e passa a
+/// aceitar só o novo; cookies antigos deixam de valer.
+pub fn rotate_token(path: &Path) -> Result<String, String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("criar {}: {}", dir.display(), e))?;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let token = random_hex(32).map_err(|e| format!("gerar token: {}", e))?;
+    let tmp = path.with_extension("tmp");
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|e| format!("gravar token: {}", e))?;
+    f.write_all(token.as_bytes())
+        .and_then(|_| f.write_all(b"\n"))
+        .map_err(|e| e.to_string())?;
+    drop(f);
+    fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+    Ok(token)
+}
+
+/// Limita tentativas de autenticação com token errado, por IP.
+/// Após `MAX_FAILS` falhas em `WINDOW`, o IP fica bloqueado por `BLOCK`.
+pub struct FailTracker {
+    map: std::sync::Mutex<std::collections::HashMap<String, FailEntry>>,
+}
+
+/// (falhas na janela, início da janela, bloqueado até)
+type FailEntry = (u32, std::time::Instant, Option<std::time::Instant>);
+
+pub const MAX_FAILS: u32 = 10;
+pub const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+pub const BLOCK: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl Default for FailTracker {
+    fn default() -> Self {
+        FailTracker {
+            map: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl FailTracker {
+    /// Segundos restantes de bloqueio, se o IP estiver bloqueado.
+    pub fn blocked(&self, ip: &str) -> Option<u64> {
+        let m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, _, until) = m.get(ip)?;
+        let until = (*until)?;
+        let now = std::time::Instant::now();
+        if until > now {
+            Some((until - now).as_secs().max(1))
+        } else {
+            None
+        }
+    }
+
+    /// Registra uma falha; devolve `true` se o IP acabou de ser bloqueado.
+    pub fn fail(&self, ip: &str) -> bool {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if m.len() > 10_000 {
+            m.retain(|_, (_, first, until)| {
+                now.duration_since(*first) < WINDOW || until.map(|u| u > now).unwrap_or(false)
+            });
+        }
+        let e = m.entry(ip.to_string()).or_insert((0, now, None));
+        if now.duration_since(e.1) > WINDOW {
+            *e = (0, now, None);
+        }
+        e.0 += 1;
+        if e.0 >= MAX_FAILS && e.2.map(|u| u <= now).unwrap_or(true) {
+            e.2 = Some(now + BLOCK);
+            e.0 = 0;
+            e.1 = now;
+            return true;
+        }
+        false
+    }
+
+    /// Quantidade de falhas recentes (usada para o atraso progressivo).
+    pub fn count(&self, ip: &str) -> u32 {
+        let m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        m.get(ip).map(|e| e.0).unwrap_or(0)
+    }
+
+    pub fn success(&self, ip: &str) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = m.get(ip) {
+            if e.2.is_none() {
+                m.remove(ip);
+            }
+        }
+    }
 }
 
 pub fn token_path() -> PathBuf {
@@ -92,7 +193,7 @@ pub fn host_ok(host: Option<&str>, allowed: &[String]) -> bool {
     match host {
         Some(h) => {
             let h = h.trim().to_lowercase();
-            allowed.iter().any(|a| *a == h)
+            allowed.contains(&h)
         }
         None => false,
     }
@@ -112,7 +213,11 @@ pub fn origin_ok(origin: Option<&str>, allowed: &[String]) -> bool {
 pub fn cookie_value<'a>(cookie_header: Option<&'a str>, name: &str) -> Option<&'a str> {
     cookie_header?.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        if k == name { Some(v) } else { None }
+        if k == name {
+            Some(v)
+        } else {
+            None
+        }
     })
 }
 
@@ -138,7 +243,12 @@ pub fn audit(action: &str, target: &str, result: &str, peer: &str) {
         target,
         result
     );
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).mode(0o600).open(dir.join("audit.log")) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(dir.join("audit.log"))
+    {
         let _ = f.write_all(line.as_bytes());
     }
 }
@@ -175,9 +285,45 @@ mod tests {
 
     #[test]
     fn cookies() {
-        assert_eq!(cookie_value(Some("a=1; pulse_token=xyz; b=2"), COOKIE), Some("xyz"));
+        assert_eq!(
+            cookie_value(Some("a=1; pulse_token=xyz; b=2"), COOKIE),
+            Some("xyz")
+        );
         assert_eq!(cookie_value(Some("a=1"), COOKIE), None);
         assert!(set_cookie("t").contains("HttpOnly; SameSite=Strict"));
+    }
+
+    #[test]
+    fn fail_tracker_blocks_after_limit() {
+        let t = FailTracker::default();
+        for _ in 0..MAX_FAILS - 1 {
+            assert!(!t.fail("1.2.3.4"));
+        }
+        assert!(t.blocked("1.2.3.4").is_none());
+        assert!(t.fail("1.2.3.4"), "décima falha bloqueia");
+        assert!(t.blocked("1.2.3.4").is_some());
+        assert!(t.blocked("5.6.7.8").is_none(), "outro IP não é afetado");
+        t.success("1.2.3.4");
+        assert!(t.blocked("1.2.3.4").is_some(), "sucesso não desbloqueia");
+        t.fail("9.9.9.9");
+        t.success("9.9.9.9");
+        assert_eq!(t.count("9.9.9.9"), 0);
+    }
+
+    #[test]
+    fn rotate_changes_token() {
+        let dir = std::env::temp_dir().join(format!("pulse-rot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let p = dir.join("token");
+        let a = load_or_create_token(&p).unwrap();
+        let b = rotate_token(&p).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(load_or_create_token(&p).unwrap(), b);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -187,11 +333,17 @@ mod tests {
         let p = dir.join("token");
         let t = load_or_create_token(&p).unwrap();
         assert_eq!(t.len(), 64);
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(load_or_create_token(&p).unwrap(), t);
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         load_or_create_token(&p).unwrap();
-        assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

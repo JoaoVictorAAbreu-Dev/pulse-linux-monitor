@@ -13,11 +13,29 @@ pub struct AgentRule {
 }
 
 pub fn default_rules() -> Vec<AgentRule> {
-    let r = |n: &str, p: &[&str]| AgentRule { name: n.into(), patterns: p.iter().map(|s| s.to_string()).collect() };
+    let r = |n: &str, p: &[&str]| AgentRule {
+        name: n.into(),
+        patterns: p.iter().map(|s| s.to_string()).collect(),
+    };
     vec![
-        r("Claude Code", &["claude", "cmd:@anthropic-ai/claude-code", "cmd:/claude-code/cli"]),
+        r(
+            "Claude Code",
+            &[
+                "claude",
+                "cmd:@anthropic-ai/claude-code",
+                "cmd:/claude-code/cli",
+            ],
+        ),
         r("Codex", &["codex", "cmd:@openai/codex", "cmd:/codex/codex"]),
-        r("OpenClaw (Ponto)", &["openclaw", "ponto", "cmd:openclaw/dist/index.js", "cmd:/bin/openclaw"]),
+        r(
+            "OpenClaw (Ponto)",
+            &[
+                "openclaw",
+                "ponto",
+                "cmd:openclaw/dist/index.js",
+                "cmd:/bin/openclaw",
+            ],
+        ),
     ]
 }
 
@@ -28,11 +46,18 @@ pub fn parse_conf(src: &str) -> Vec<AgentRule> {
         .filter(|l| !l.is_empty())
         .filter_map(|l| {
             let (n, p) = l.split_once('=')?;
-            let patterns: Vec<String> = p.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+            let patterns: Vec<String> = p
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect();
             if n.trim().is_empty() || patterns.is_empty() {
                 return None;
             }
-            Some(AgentRule { name: n.trim().to_string(), patterns })
+            Some(AgentRule {
+                name: n.trim().to_string(),
+                patterns,
+            })
         })
         .collect()
 }
@@ -81,7 +106,11 @@ pub fn mcp_label(p: &Proc) -> Option<String> {
         .filter(|a| !a.starts_with('-'))
         .map(|a| a.trim_end_matches('/').rsplit('/').next().unwrap_or(a))
         .find(|b| b.to_lowercase().contains("mcp") && !b.to_lowercase().contains("pulse"))
-        .map(|b| b.trim_end_matches(".js").trim_end_matches(".py").to_string())
+        .map(|b| {
+            b.trim_end_matches(".js")
+                .trim_end_matches(".py")
+                .to_string()
+        })
 }
 
 /// Agrupa processos de agentes por raiz (processo casado cujo pai não casa
@@ -92,17 +121,25 @@ pub fn detect(rules: &[AgentRule], list: &[Proc]) -> Vec<AgentProc> {
     for p in list {
         kids.entry(p.ppid).or_default().push(p);
     }
-    let matched: HashMap<i32, &AgentRule> =
-        list.iter().filter_map(|p| match_rule(rules, p).map(|r| (p.pid, r))).collect();
+    let matched: HashMap<i32, &AgentRule> = list
+        .iter()
+        .filter_map(|p| match_rule(rules, p).map(|r| (p.pid, r)))
+        .collect();
     let mut out = Vec::new();
     for p in list {
-        let Some(rule) = matched.get(&p.pid) else { continue };
+        let Some(rule) = matched.get(&p.pid) else {
+            continue;
+        };
         // Sobe a árvore: se algum ancestral é do mesmo agente, não é raiz.
         let mut anc = p.ppid;
         let mut is_root = true;
         let mut guard = 0;
         while anc > 1 && guard < 64 {
-            if matched.get(&anc).map(|r| r.name == rule.name).unwrap_or(false) {
+            if matched
+                .get(&anc)
+                .map(|r| r.name == rule.name)
+                .unwrap_or(false)
+            {
                 is_root = false;
                 break;
             }
@@ -130,11 +167,19 @@ pub fn detect(rules: &[AgentRule], list: &[Proc]) -> Vec<AgentProc> {
             tree_cpu: p.cpu + desc.iter().map(|d| d.cpu).sum::<f64>(),
             tree_rss: p.rss + desc.iter().map(|d| d.rss).sum::<u64>(),
             cwd: procs::cwd(p.pid),
-            mcp: desc.iter().filter(|d| is_mcp(d)).map(|d| (*d).clone()).collect(),
+            mcp: desc
+                .iter()
+                .filter(|d| is_mcp(d))
+                .map(|d| (*d).clone())
+                .collect(),
             root: p.clone(),
         });
     }
-    out.sort_by(|a, b| b.tree_cpu.partial_cmp(&a.tree_cpu).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.tree_cpu
+            .partial_cmp(&a.tree_cpu)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
 }
 
@@ -156,7 +201,13 @@ pub fn to_json(list: &[AgentProc]) -> String {
             .raw(
                 "mcp",
                 &json::arr(a.mcp.iter().map(|m| {
-                    Obj::new().i("pid", m.pid as i64).s("name", &mcp_label(m).unwrap_or_else(|| m.name.clone())).s("cmd", &m.cmd).n("cpu", m.cpu).u("rss", m.rss).finish()
+                    Obj::new()
+                        .i("pid", m.pid as i64)
+                        .s("name", &mcp_label(m).unwrap_or_else(|| m.name.clone()))
+                        .s("cmd", &m.cmd)
+                        .n("cpu", m.cpu)
+                        .u("rss", m.rss)
+                        .finish()
                 })),
             )
             .finish()
@@ -168,7 +219,16 @@ mod tests {
     use super::*;
 
     fn p(pid: i32, ppid: i32, name: &str, cmd: &str, cpu: f64) -> Proc {
-        Proc { pid, ppid, name: name.into(), cmd: cmd.into(), cpu, rss: 1000, state: 'S', ..Default::default() }
+        Proc {
+            pid,
+            ppid,
+            name: name.into(),
+            cmd: cmd.into(),
+            cpu,
+            rss: 1000,
+            state: 'S',
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -188,8 +248,20 @@ mod tests {
             p(12, 11, "node", "node /x/mcp-server-filesystem /tmp", 1.0),
             p(13, 11, "bash", "bash -c 'grep mcp x'", 0.5),
             p(14, 11, "claude", "claude --child", 0.0),
-            p(20, 1, "node-MainThread", "/opt/node/bin/node /x/lib/node_modules/openclaw/dist/index.js gateway", 2.0),
-            p(30, 1, "claude-desktop", "/usr/lib/claude-desktop/claude-desktop", 9.0),
+            p(
+                20,
+                1,
+                "node-MainThread",
+                "/opt/node/bin/node /x/lib/node_modules/openclaw/dist/index.js gateway",
+                2.0,
+            ),
+            p(
+                30,
+                1,
+                "claude-desktop",
+                "/usr/lib/claude-desktop/claude-desktop",
+                9.0,
+            ),
             p(40, 1, "codex", "codex exec", 0.1),
         ];
         let a = detect(&rules, &list);
@@ -198,7 +270,10 @@ mod tests {
         assert_eq!(c.root.pid, 11);
         assert_eq!(c.children, 3);
         assert_eq!(c.mcp.len(), 1, "shell que menciona mcp não conta");
-        assert_eq!(mcp_label(&c.mcp[0]).as_deref(), Some("mcp-server-filesystem"));
+        assert_eq!(
+            mcp_label(&c.mcp[0]).as_deref(),
+            Some("mcp-server-filesystem")
+        );
         assert!((c.tree_cpu - 6.5).abs() < 1e-9);
         assert!(a.iter().any(|x| x.agent == "OpenClaw (Ponto)"));
     }

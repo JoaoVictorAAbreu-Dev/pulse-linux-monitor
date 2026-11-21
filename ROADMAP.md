@@ -9,7 +9,12 @@ expor conteúdo de conversas dos agentes.
 
 ---
 
-## Fase 1 — Confiabilidade e distribuição (próximas 2 semanas)
+## Fase 1 — Confiabilidade e distribuição
+
+**Status (21/11/2026):** 1.1–1.6 implementados e validados localmente (fmt, clippy `-D warnings`,
+81 testes, lintian sem avisos, instalação/remoção do `.deb` num contêiner Ubuntu 24.04).
+O workflow de CI ainda precisa rodar no GitHub para ser considerado validado lá.
+1.7 pendente (exige chave GPG e GitHub Pages — decisão do mantenedor).
 
 | # | Item | Esforço | Por quê / o quê | Validação |
 |---|---|---|---|---|

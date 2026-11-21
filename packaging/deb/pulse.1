@@ -1,0 +1,78 @@
+.TH PULSE 1 "2026-11-21" "pulse-monitor 0.1.0" "Comandos do usuário"
+.SH NOME
+pulse \- monitor do Ubuntu com painel de agentes de IA
+.SH SINOPSE
+.B pulse
+[\fB\-\-port\fR \fIN\fR] [\fB\-\-bind\fR \fIIP\fR] [\fB\-\-allow\-remote\fR]
+[\fB\-\-interval\-ms\fR \fIN\fR] [\fB\-\-notify\fR] [\fB\-\-no\-agents\fR]
+[\fB\-\-config\fR \fIARQ\fR]
+.br
+.B pulse
+\fB\-\-once\fR | \fB\-\-print\-token\fR | \fB\-\-rotate\-token\fR | \fB\-\-print\-config\fR | \fB\-h\fR
+.SH DESCRIÇÃO
+.B pulse
+é um daemon leve que lê /proc, /sys, statvfs, systemctl e journalctl e serve
+uma interface web local (padrão \fIhttp://127.0.0.1:7878\fR) com CPU, memória,
+discos, processos, serviços, timers, cron, contêineres, rede, logs, alertas e
+os agentes de IA (Claude Code, Codex, OpenClaw) com sessões e eventos ao vivo.
+.PP
+Normalmente roda como serviço de usuário:
+.B systemctl \-\-user enable \-\-now pulse
+.SH OPÇÕES
+.TP
+.BR \-\-port " " \fIN\fR
+Porta HTTP (padrão 7878).
+.TP
+.BR \-\-bind " " \fIIP\fR
+Endereço de escuta (padrão 127.0.0.1). Fora do loopback exige \fB\-\-allow\-remote\fR.
+.TP
+.B \-\-allow\-remote
+Permite expor o painel na rede. Não há TLS: prefira um túnel SSH.
+.TP
+.BR \-\-interval\-ms " " \fIN\fR
+Intervalo do coletor em milissegundos (padrão 1000, mínimo 250).
+.TP
+.B \-\-notify
+Envia alertas novos ao desktop via \fBnotify\-send\fR(1).
+.TP
+.B \-\-no\-agents
+Desativa detecção de agentes, sessões e hooks.
+.TP
+.BR \-\-config " " \fIARQ\fR
+Arquivo de configuração (padrão \fI~/.config/pulse/config.toml\fR).
+.TP
+.B \-\-once
+Coleta duas amostras, imprime o snapshot JSON e sai.
+.TP
+.B \-\-print\-token
+Imprime a URL de acesso com o token no fragmento (#token=…) e sai.
+.TP
+.B \-\-rotate\-token
+Gera um token novo. O daemon em execução passa a aceitá-lo em até 3 s; cookies antigos deixam de valer.
+.TP
+.B \-\-print\-config
+Imprime um config.toml de exemplo comentado.
+.SH SEGURANÇA
+Escuta só no loopback. Toda rota de dados exige o token (cookie HttpOnly ou
+cabeçalho \fBX\-Pulse\-Token\fR); requisições POST exigem o cabeçalho. Host e
+Origin são validados. Após 10 tentativas com token errado em 10 minutos o IP
+fica bloqueado por 5 minutos. Ações sensíveis vão para o log de auditoria.
+.SH ARQUIVOS
+.TP
+.I ~/.config/pulse/token
+Token de acesso (modo 0600).
+.TP
+.I ~/.config/pulse/config.toml
+Porta, intervalo, retenção ([history] retention_days) e limiares ([alerts]).
+.TP
+.I ~/.config/pulse/agents.conf
+Regras extras de detecção de agentes.
+.TP
+.I ~/.local/state/pulse/
+history.log (histórico longo), hooks.log, alerts.log e audit.log.
+.SH VEJA TAMBÉM
+.BR pulse\-hook (1),
+.BR systemctl (1),
+.BR journalctl (1)
+.PP
+https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor

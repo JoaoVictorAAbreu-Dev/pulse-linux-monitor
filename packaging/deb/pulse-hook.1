@@ -1,0 +1,18 @@
+.TH PULSE-HOOK 1 "2026-11-21" "pulse-monitor 0.1.0" "Comandos do usuário"
+.SH NOME
+pulse-hook \- envia o estado de um agente de IA ao Pulse
+.SH SINOPSE
+.B pulse-hook
+\fIestado\fR [\fIagente\fR] [\fIjson\fR]
+.SH DESCRIÇÃO
+Chamado pelos hooks do Claude Code (JSON pela entrada padrão) ou pelo
+\fBnotify\fR do Codex (JSON como terceiro argumento). Estados:
+\fBexecutando\fR, \fBatencao\fR, \fBaguardando\fR, \fBconcluido\fR.
+Nunca bloqueia o agente: tempo limite de 2 s e saída sempre 0. O token é
+lido de \fI~/.config/pulse/token\fR e passado ao curl pela entrada padrão.
+.SH AMBIENTE
+.TP
+.B PULSE_PORT
+Porta do daemon (padrão 7878).
+.SH VEJA TAMBÉM
+.BR pulse (1)

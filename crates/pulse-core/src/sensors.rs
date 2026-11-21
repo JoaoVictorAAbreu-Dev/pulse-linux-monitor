@@ -17,8 +17,11 @@ pub fn temps() -> Vec<Temp> {
         let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).collect();
         dirs.sort();
         for d in dirs {
-            let chip = sys::read_trim(&format!("{}/name", d.display())).unwrap_or_else(|| "hwmon".into());
-            let Ok(files) = std::fs::read_dir(&d) else { continue };
+            let chip =
+                sys::read_trim(&format!("{}/name", d.display())).unwrap_or_else(|| "hwmon".into());
+            let Ok(files) = std::fs::read_dir(&d) else {
+                continue;
+            };
             let mut inputs: Vec<String> = files
                 .flatten()
                 .map(|f| f.file_name().to_string_lossy().into_owned())
@@ -27,7 +30,9 @@ pub fn temps() -> Vec<Temp> {
             inputs.sort();
             for inp in inputs {
                 let base = inp.trim_end_matches("_input");
-                let Some(milli) = sys::read_trim(&format!("{}/{}", d.display(), inp)).and_then(|s| s.parse::<f64>().ok()) else {
+                let Some(milli) = sys::read_trim(&format!("{}/{}", d.display(), inp))
+                    .and_then(|s| s.parse::<f64>().ok())
+                else {
                     continue;
                 };
                 let c = milli / 1000.0;
@@ -35,7 +40,8 @@ pub fn temps() -> Vec<Temp> {
                     continue;
                 }
                 v.push(Temp {
-                    label: sys::read_trim(&format!("{}/{}_label", d.display(), base)).unwrap_or_else(|| base.to_string()),
+                    label: sys::read_trim(&format!("{}/{}_label", d.display(), base))
+                        .unwrap_or_else(|| base.to_string()),
                     chip: chip.clone(),
                     celsius: c,
                     crit: sys::read_trim(&format!("{}/{}_crit", d.display(), base))
@@ -55,11 +61,14 @@ pub fn temps() -> Vec<Temp> {
                     continue;
                 }
                 let p = e.path();
-                if let Some(c) = sys::read_trim(&format!("{}/temp", p.display())).and_then(|s| s.parse::<f64>().ok()) {
+                if let Some(c) = sys::read_trim(&format!("{}/temp", p.display()))
+                    .and_then(|s| s.parse::<f64>().ok())
+                {
                     let c = c / 1000.0;
                     if c > 0.0 && c < 150.0 {
                         v.push(Temp {
-                            chip: sys::read_trim(&format!("{}/type", p.display())).unwrap_or(n.clone()),
+                            chip: sys::read_trim(&format!("{}/type", p.display()))
+                                .unwrap_or(n.clone()),
                             label: n,
                             celsius: c,
                             crit: None,
@@ -74,12 +83,19 @@ pub fn temps() -> Vec<Temp> {
 
 pub fn temps_json(t: &[Temp]) -> String {
     json::arr(t.iter().map(|x| {
-        Obj::new().s("chip", &x.chip).s("label", &x.label).n("c", x.celsius).opt_n("crit", x.crit).finish()
+        Obj::new()
+            .s("chip", &x.chip)
+            .s("label", &x.label)
+            .n("c", x.celsius)
+            .opt_n("crit", x.crit)
+            .finish()
     }))
 }
 
 pub fn max_temp(t: &[Temp]) -> Option<f64> {
-    t.iter().map(|x| x.celsius).fold(None, |a, b| Some(a.map_or(b, |a: f64| a.max(b))))
+    t.iter()
+        .map(|x| x.celsius)
+        .fold(None, |a, b| Some(a.map_or(b, |a: f64| a.max(b))))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,15 +138,28 @@ mod tests {
 
     #[test]
     fn os_release() {
-        assert_eq!(parse_os_release("NAME=\"Ubuntu\"\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n"), "Ubuntu 24.04 LTS");
+        assert_eq!(
+            parse_os_release("NAME=\"Ubuntu\"\nPRETTY_NAME=\"Ubuntu 24.04 LTS\"\n"),
+            "Ubuntu 24.04 LTS"
+        );
         assert_eq!(parse_os_release(""), "Linux");
     }
 
     #[test]
     fn max_of_temps() {
         let t = vec![
-            Temp { chip: "a".into(), label: "x".into(), celsius: 40.0, crit: None },
-            Temp { chip: "b".into(), label: "y".into(), celsius: 70.5, crit: None },
+            Temp {
+                chip: "a".into(),
+                label: "x".into(),
+                celsius: 40.0,
+                crit: None,
+            },
+            Temp {
+                chip: "b".into(),
+                label: "y".into(),
+                celsius: 70.5,
+                crit: None,
+            },
         ];
         assert_eq!(max_temp(&t), Some(70.5));
         assert_eq!(max_temp(&[]), None);

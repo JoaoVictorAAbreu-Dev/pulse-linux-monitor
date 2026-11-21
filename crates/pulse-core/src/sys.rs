@@ -58,7 +58,11 @@ pub fn fs_stat(path: &str) -> Option<FsStat> {
     if rc != 0 {
         return None;
     }
-    let fr = if s.f_frsize > 0 { s.f_frsize } else { s.f_bsize };
+    let fr = if s.f_frsize > 0 {
+        s.f_frsize
+    } else {
+        s.f_bsize
+    };
     Some(FsStat {
         total: s.f_blocks * fr,
         free: s.f_bfree * fr,
@@ -98,13 +102,21 @@ pub fn renice(pid: i32, nice: i32) -> Result<(), String> {
 pub fn clock_ticks() -> f64 {
     // SAFETY: sysconf é segura para constantes conhecidas.
     let v = unsafe { sysconf(SC_CLK_TCK) };
-    if v > 0 { v as f64 } else { 100.0 }
+    if v > 0 {
+        v as f64
+    } else {
+        100.0
+    }
 }
 
 pub fn page_size() -> u64 {
     // SAFETY: idem.
     let v = unsafe { sysconf(SC_PAGESIZE) };
-    if v > 0 { v as u64 } else { 4096 }
+    if v > 0 {
+        v as u64
+    } else {
+        4096
+    }
 }
 
 pub fn uid() -> u32 {
@@ -130,11 +142,16 @@ pub fn read_u64(path: &str) -> Option<u64> {
 }
 
 pub fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
 /// `$XDG_CONFIG_HOME/pulse` ou `~/.config/pulse`.
@@ -199,7 +216,11 @@ pub fn iso_utc(ms: u64) -> String {
 }
 
 /// Executa um comando com tempo limite, devolvendo (status ok, stdout, stderr).
-pub fn run_cmd(prog: &str, args: &[&str], timeout_ms: u64) -> Result<(bool, String, String), String> {
+pub fn run_cmd(
+    prog: &str,
+    args: &[&str],
+    timeout_ms: u64,
+) -> Result<(bool, String, String), String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     let mut child = Command::new(prog)
@@ -251,7 +272,9 @@ mod tests {
 
     #[test]
     fn passwd() {
-        let m = parse_passwd("root:x:0:0:root:/root:/bin/bash\nbad\nana:x:1000:1000::/home/ana:/bin/sh\n");
+        let m = parse_passwd(
+            "root:x:0:0:root:/root:/bin/bash\nbad\nana:x:1000:1000::/home/ana:/bin/sh\n",
+        );
         assert_eq!(m.get(&0).unwrap(), "root");
         assert_eq!(m.get(&1000).unwrap(), "ana");
     }

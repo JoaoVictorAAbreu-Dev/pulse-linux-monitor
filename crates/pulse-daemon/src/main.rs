@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod config;
 mod http;
+mod settings;
 mod state;
 
 use http::{ParseError, Response};
@@ -17,14 +18,57 @@ use std::time::Duration;
 const MAX_CONNECTIONS: usize = 64;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
+fn fail(msg: &str, code: i32) -> ! {
+    eprintln!("pulse: {}", msg);
+    std::process::exit(code);
+}
+
 fn main() {
-    let cfg = match config::parse(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // 1) arquivo de configuração (padrões < arquivo < flags)
+    let cfg_path = config::config_arg(&args).unwrap_or_else(settings::path);
+    let (file, mut warnings) = match std::fs::read_to_string(&cfg_path) {
+        Ok(src) => settings::parse(&src),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => (
+            Default::default(),
+            vec![format!(
+                "não foi possível ler {}: {}",
+                cfg_path.display(),
+                e
+            )],
+        ),
+    };
+    let base = config::Config::from_file(&file).unwrap_or_else(|e| fail(&e, 2));
+    let cfg = match config::parse_with(base, args) {
         Ok(c) => c,
+        Err(e) => fail(&format!("{}\n\nUse --help para ver as opções.", e), 2),
+    };
+    let rules = match settings::apply_alerts(&Default::default(), &file.alerts) {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("pulse: {}\n\nUse --help para ver as opções.", e);
-            std::process::exit(2);
+            warnings.push(format!("[alerts] ignorado: {}", e));
+            Default::default()
         }
     };
+    if cfg.print_config {
+        print!("{}", settings::EXAMPLE);
+        return;
+    }
+    if cfg.rotate_token {
+        match auth::rotate_token(&auth::token_path()) {
+            Ok(_) => {
+                auth::audit("token.rotate", "pulse --rotate-token", "ok", "local");
+                println!(
+                    "Token novo gravado em {}. O daemon em execução passa a aceitá-lo em até 3 s;\n\
+                     sessões abertas no navegador precisam entrar de novo (pulse --print-token).",
+                    auth::token_path().display()
+                );
+                return;
+            }
+            Err(e) => fail(&format!("não foi possível trocar o token: {}", e), 1),
+        }
+    }
     if cfg.help {
         print!("{}", config::HELP);
         return;
@@ -40,7 +84,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let host = if cfg.bind.is_loopback() { "127.0.0.1".to_string() } else { cfg.bind.to_string() };
+    let host = if cfg.bind.is_loopback() {
+        "127.0.0.1".to_string()
+    } else {
+        cfg.bind.to_string()
+    };
     if cfg.print_token {
         println!("http://{}:{}/#token={}", host, cfg.port, token);
         return;
@@ -54,10 +102,19 @@ fn main() {
         }
     };
     let allowed = auth::allowed_hosts(cfg.port, cfg.bind, cfg.allow_remote);
-    let shared = Shared::new(cfg.clone(), token, allowed);
+    for w in &warnings {
+        eprintln!("pulse: config {}: {}", cfg_path.display(), w);
+    }
+    let shared = Shared::new(cfg.clone(), token, allowed, rules, cfg_path, warnings);
     // O token nunca vai para o log: só o caminho do arquivo.
-    eprintln!("pulse: ouvindo em http://{} (intervalo {} ms)", addr, cfg.interval_ms);
-    eprintln!("pulse: token em {} — use `pulse --print-token` para obter a URL de acesso", auth::token_path().display());
+    eprintln!(
+        "pulse: ouvindo em http://{} (intervalo {} ms)",
+        addr, cfg.interval_ms
+    );
+    eprintln!(
+        "pulse: token em {} — use `pulse --print-token` para obter a URL de acesso",
+        auth::token_path().display()
+    );
     if cfg.allow_remote && !cfg.bind.is_loopback() {
         eprintln!("pulse: ATENÇÃO: painel acessível pela rede em {}", addr);
     }
@@ -75,10 +132,12 @@ fn main() {
         }
         ACTIVE.fetch_add(1, Ordering::SeqCst);
         let sh = shared.clone();
-        let spawned = std::thread::Builder::new().name("http".into()).spawn(move || {
-            serve(sh, stream);
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        });
+        let spawned = std::thread::Builder::new()
+            .name("http".into())
+            .spawn(move || {
+                serve(sh, stream);
+                ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            });
         if spawned.is_err() {
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
         }
@@ -86,13 +145,19 @@ fn main() {
 }
 
 fn serve(sh: Arc<Shared>, mut stream: TcpStream) {
-    let peer = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "?".into());
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "?".into());
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let req = match http::read_request(&mut stream) {
         Ok(r) => r,
         Err(ParseError::Closed) => return,
         Err(ParseError::TooLarge) => {
-            let _ = http::write_response(&mut stream, &Response::error(413, "requisição grande demais"));
+            let _ = http::write_response(
+                &mut stream,
+                &Response::error(413, "requisição grande demais"),
+            );
             return;
         }
         Err(ParseError::Bad(m)) => {
@@ -124,7 +189,10 @@ fn sse(sh: &Shared, mut s: TcpStream) {
         let (snap, seq, hook_ev) = {
             let mut st = sh.lock();
             while st.seq == last_seq && st.hooks.received == last_hooks {
-                let (g, to) = sh.tick.wait_timeout(st, Duration::from_secs(15)).unwrap_or_else(|e| e.into_inner());
+                let (g, to) = sh
+                    .tick
+                    .wait_timeout(st, Duration::from_secs(15))
+                    .unwrap_or_else(|e| e.into_inner());
                 st = g;
                 if to.timed_out() {
                     break;
@@ -136,7 +204,11 @@ fn sse(sh: &Shared, mut s: TcpStream) {
             } else {
                 None
             };
-            let snap = if st.seq != last_seq { Some(st.snapshot.clone()) } else { None };
+            let snap = if st.seq != last_seq {
+                Some(st.snapshot.clone())
+            } else {
+                None
+            };
             (snap, st.seq, hook_ev)
         };
         let mut out = String::new();

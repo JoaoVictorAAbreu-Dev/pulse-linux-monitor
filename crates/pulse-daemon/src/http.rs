@@ -19,7 +19,9 @@ pub struct Request {
 
 impl Request {
     pub fn header(&self, k: &str) -> Option<&str> {
-        self.headers.get(&k.to_ascii_lowercase()).map(|s| s.as_str())
+        self.headers
+            .get(&k.to_ascii_lowercase())
+            .map(|s| s.as_str())
     }
     pub fn q(&self, k: &str) -> Option<&str> {
         self.query.get(k).map(|s| s.as_str())
@@ -34,7 +36,9 @@ pub fn percent_decode(s: &str) -> String {
         match b[i] {
             b'+' => out.push(b' '),
             b'%' => {
-                let hex = b.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
+                let hex = b
+                    .get(i + 1..i + 3)
+                    .and_then(|h| std::str::from_utf8(h).ok());
                 match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
                     Some(v) => {
                         out.push(v);
@@ -71,7 +75,9 @@ pub enum ParseError {
 /// Analisa cabeçalhos já lidos (até `\r\n\r\n`).
 pub fn parse_head(head: &str) -> Result<Request, ParseError> {
     let mut lines = head.split("\r\n");
-    let first = lines.next().ok_or(ParseError::Bad("linha inicial ausente"))?;
+    let first = lines
+        .next()
+        .ok_or(ParseError::Bad("linha inicial ausente"))?;
     let mut parts = first.split(' ');
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().ok_or(ParseError::Bad("alvo ausente"))?;
@@ -88,10 +94,18 @@ pub fn parse_head(head: &str) -> Result<Request, ParseError> {
         if l.is_empty() {
             continue;
         }
-        let (k, v) = l.split_once(':').ok_or(ParseError::Bad("cabeçalho inválido"))?;
+        let (k, v) = l
+            .split_once(':')
+            .ok_or(ParseError::Bad("cabeçalho inválido"))?;
         headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
     }
-    Ok(Request { method, path: percent_decode(path), query: parse_query(query), headers, body: Vec::new() })
+    Ok(Request {
+        method,
+        path: percent_decode(path),
+        query: parse_query(query),
+        headers,
+        body: Vec::new(),
+    })
 }
 
 pub fn read_request(s: &mut TcpStream) -> Result<Request, ParseError> {
@@ -113,10 +127,13 @@ pub fn read_request(s: &mut TcpStream) -> Result<Request, ParseError> {
             return Err(ParseError::TooLarge);
         }
     }
-    let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| ParseError::Bad("cabeçalho não UTF-8"))?;
+    let head = std::str::from_utf8(&buf[..head_end])
+        .map_err(|_| ParseError::Bad("cabeçalho não UTF-8"))?;
     let mut req = parse_head(head)?;
     let len: usize = match req.header("content-length") {
-        Some(v) => v.parse().map_err(|_| ParseError::Bad("content-length inválido"))?,
+        Some(v) => v
+            .parse()
+            .map_err(|_| ParseError::Bad("content-length inválido"))?,
         None => 0,
     };
     if req.header("transfer-encoding").is_some() {
@@ -147,7 +164,12 @@ pub struct Response {
 
 impl Response {
     pub fn new(status: u16, ctype: &'static str, body: impl Into<Vec<u8>>) -> Self {
-        Response { status, ctype, body: body.into(), headers: Vec::new() }
+        Response {
+            status,
+            ctype,
+            body: body.into(),
+            headers: Vec::new(),
+        }
     }
     pub fn json(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Self::new(status, "application/json; charset=utf-8", body)
@@ -156,7 +178,10 @@ impl Response {
         Self::json(200, body)
     }
     pub fn error(status: u16, msg: &str) -> Self {
-        Self::json(status, format!("{{\"error\":{}}}", pulse_core::json::quote(msg)))
+        Self::json(
+            status,
+            format!("{{\"error\":{}}}", pulse_core::json::quote(msg)),
+        )
     }
     pub fn with_header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.to_string(), v.to_string()));
@@ -176,6 +201,7 @@ pub fn reason(status: u16) -> &'static str {
         409 => "Conflict",
         413 => "Payload Too Large",
         421 => "Misdirected Request",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",

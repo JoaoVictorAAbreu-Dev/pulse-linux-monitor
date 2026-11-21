@@ -34,10 +34,17 @@ pub struct LongStore {
     file_lines: usize,
     pub last_error: Option<String>,
     pub compactions: u64,
+    retention_ms: u64,
 }
 
 fn fmt_line(p: &Point) -> String {
-    let f = |v: f64| if v.is_finite() { format!("{:.3}", v) } else { "-".to_string() };
+    let f = |v: f64| {
+        if v.is_finite() {
+            format!("{:.3}", v)
+        } else {
+            "-".to_string()
+        }
+    };
     format!(
         "{} {} {} {} {} {} {} {} {}\n",
         p.ts,
@@ -63,7 +70,11 @@ pub fn parse_line(line: &str) -> Option<Point> {
             return Some(f64::NAN);
         }
         let v: f64 = s.parse().ok()?;
-        if v.is_finite() { Some(v) } else { None }
+        if v.is_finite() {
+            Some(v)
+        } else {
+            None
+        }
     };
     let cpu = n(f[1])?;
     if !cpu.is_finite() {
@@ -85,6 +96,11 @@ pub fn parse_line(line: &str) -> Option<Point> {
 impl LongStore {
     /// Abre (ou cria) o armazenamento e recarrega pontos válidos do arquivo.
     pub fn open(path: impl Into<PathBuf>, cap: usize, now_ms: u64) -> Self {
+        Self::open_with(path, cap, RETENTION_MS, now_ms)
+    }
+
+    /// Como `open`, com retenção explícita (ex.: `dias × 86 400 000`).
+    pub fn open_with(path: impl Into<PathBuf>, cap: usize, retention_ms: u64, now_ms: u64) -> Self {
         let path = path.into();
         let mut s = LongStore {
             path,
@@ -94,6 +110,7 @@ impl LongStore {
             file_lines: 0,
             last_error: None,
             compactions: 0,
+            retention_ms: retention_ms.max(BUCKET_MS),
         };
         s.load(now_ms);
         s
@@ -108,7 +125,7 @@ impl LongStore {
                 return;
             }
         };
-        let cutoff = now_ms.saturating_sub(RETENTION_MS);
+        let cutoff = now_ms.saturating_sub(self.retention_ms);
         let mut last_ts = 0u64;
         for line in txt.lines() {
             self.file_lines += 1;
@@ -152,7 +169,10 @@ impl LongStore {
                 }
             }
         }
-        let acc = self.acc.get_or_insert_with(|| Acc { bucket, ..Default::default() });
+        let acc = self.acc.get_or_insert_with(|| Acc {
+            bucket,
+            ..Default::default()
+        });
         acc.n += 1;
         acc.sum.cpu += p.cpu;
         acc.sum.mem += p.mem;
@@ -181,7 +201,11 @@ impl LongStore {
             tx: a.sum.tx / n,
             rd: a.sum.rd / n,
             wr: a.sum.wr / n,
-            temp: if a.temp_n > 0 { a.sum.temp / a.temp_n as f64 } else { f64::NAN },
+            temp: if a.temp_n > 0 {
+                a.sum.temp / a.temp_n as f64
+            } else {
+                f64::NAN
+            },
         };
         if let Some(last) = self.points.back() {
             if p.ts <= last.ts {
@@ -189,8 +213,10 @@ impl LongStore {
             }
         }
         self.points.push_back(p);
-        let cutoff = p.ts.saturating_sub(RETENTION_MS);
-        while self.points.len() > self.cap || self.points.front().map(|x| x.ts < cutoff).unwrap_or(false) {
+        let cutoff = p.ts.saturating_sub(self.retention_ms);
+        while self.points.len() > self.cap
+            || self.points.front().map(|x| x.ts < cutoff).unwrap_or(false)
+        {
             self.points.pop_front();
         }
         self.append(&p);
@@ -239,7 +265,12 @@ impl LongStore {
             body.push_str(&fmt_line(p));
         }
         let r = (|| -> std::io::Result<()> {
-            let mut f = OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
             f.write_all(body.as_bytes())?;
             f.sync_all()?;
             std::fs::rename(&tmp, &self.path)
@@ -261,8 +292,12 @@ impl LongStore {
         let it = self.points.iter().filter(move |p| p.ts >= since_ms);
         crate::json::Obj::new()
             .u("bucket_ms", BUCKET_MS)
-            .u("count", self.points.iter().filter(|p| p.ts >= since_ms).count() as u64)
+            .u(
+                "count",
+                self.points.iter().filter(|p| p.ts >= since_ms).count() as u64,
+            )
             .u("capacity", self.cap as u64)
+            .u("retention_ms", self.retention_ms)
             .opt_s("error", self.last_error.as_deref())
             .raw("points", &columns_json(it))
             .finish()
@@ -280,7 +315,17 @@ mod tests {
     }
 
     fn pt(ts: u64, cpu: f64) -> Point {
-        Point { ts, cpu, mem: 50.0, swap: 0.0, rx: 10.0, tx: 20.0, rd: 0.0, wr: 0.0, temp: f64::NAN }
+        Point {
+            ts,
+            cpu,
+            mem: 50.0,
+            swap: 0.0,
+            rx: 10.0,
+            tx: 20.0,
+            rd: 0.0,
+            wr: 0.0,
+            temp: f64::NAN,
+        }
     }
 
     const T0: u64 = 1_700_000_000_000 - (1_700_000_000_000 % BUCKET_MS);
@@ -316,7 +361,8 @@ mod tests {
         }
         // corrompe o arquivo
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"lixo\n1 2 3\n\n99 NaN 1 1 1 1 1 1 1\n").unwrap();
+        f.write_all(b"lixo\n1 2 3\n\n99 NaN 1 1 1 1 1 1 1\n")
+            .unwrap();
         drop(f);
         let s = LongStore::open(&path, 100, T0 + 10 * BUCKET_MS);
         assert_eq!(s.len(), 4);
@@ -355,6 +401,19 @@ mod tests {
         let s = LongStore::open(&path, 100, T0 + RETENTION_MS + 2 * BUCKET_MS);
         assert_eq!(s.len(), 1);
         assert_eq!(s.points().next().unwrap().cpu, 2.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn custom_retention() {
+        let dir = tmpdir("ret2");
+        let mut s = LongStore::open_with(dir.join("h.log"), 1000, 3 * BUCKET_MS, T0);
+        for m in 0..10 {
+            s.add(pt(T0 + m * BUCKET_MS, m as f64));
+        }
+        // fechados: 0..8; retenção de 3 min a partir do último (8) mantém 5..8
+        assert_eq!(s.len(), 4);
+        assert_eq!(s.points().next().unwrap().cpu, 5.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

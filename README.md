@@ -1,5 +1,7 @@
 # Pulse
 
+[![CI](https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor/actions/workflows/ci.yml)
+
 Monitor para Ubuntu com painel de agentes de IA. Um daemon em Rust (só biblioteca
 padrão) lê `/proc`, `/sys`, `statvfs`, `systemctl` e `journalctl` e serve uma
 interface web "Liquid Glass" em `http://127.0.0.1:7878`.
@@ -18,14 +20,17 @@ Requisitos: Rust estável (`rustup`), `curl` (para o `pulse-hook`). Sem crates e
 
 ### Pacote .deb (Ubuntu 24.04+ / Debian com glibc ≥ 2.39)
 
+Baixe o `.deb` da página de Releases do GitHub (amd64 e arm64) ou gere localmente:
+
 ```sh
 packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
+packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
 sudo apt install ./target/deb/pulse-monitor_0.1.0_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 ```
 
 O pacote instala `/usr/bin/pulse`, `/usr/bin/pulse-hook`, `/usr/bin/pulse-open` (abre o painel no
-navegador), o serviço de usuário em `/usr/lib/systemd/user/pulse.service`, o atalho **Pulse** no menu de
+navegador), man pages, autocompletar do bash, exemplos de `config.toml`/`agents.conf`, o serviço de usuário em `/usr/lib/systemd/user/pulse.service`, o atalho **Pulse** no menu de
 aplicativos e o ícone. O serviço **não** é habilitado automaticamente para todos os usuários.
 Se você também usou o `install.sh`, a unidade em `~/.config/systemd/user/` tem prioridade; remova-a
 (e `~/.local/bin/pulse*`) para usar a versão do pacote.
@@ -34,7 +39,8 @@ Se você também usou o `install.sh`, a unidade em `~/.config/systemd/user/` tem
 
 ```
 pulse [--port 7878] [--bind 127.0.0.1] [--allow-remote] [--interval-ms 1000]
-      [--notify] [--no-agents] [--print-token] [--once] [-h]
+      [--notify] [--no-agents] [--config ARQ]
+pulse --once | --print-token | --rotate-token | --print-config | -h
 ```
 
 | Flag | Efeito |
@@ -46,6 +52,35 @@ pulse [--port 7878] [--bind 127.0.0.1] [--allow-remote] [--interval-ms 1000]
 | `--no-agents` | desliga detecção de agentes, sessões e hooks |
 | `--print-token` | imprime a URL de acesso e sai |
 | `--once` | coleta duas amostras, imprime o snapshot JSON e sai |
+| `--config ARQ` | arquivo de configuração (padrão `~/.config/pulse/config.toml`) |
+| `--rotate-token` | gera um token novo; o daemon em execução o adota em até 3 s |
+| `--print-config` | imprime um `config.toml` de exemplo comentado |
+
+### Arquivo de configuração
+
+`~/.config/pulse/config.toml` (subconjunto de TOML). Precedência: padrões < arquivo < flags.
+
+```toml
+port = 7878
+interval_ms = 1000
+notify = false
+
+[history]
+retention_days = 7      # 1 a 90 dias de médias de 60 s
+
+[alerts]
+cpu_pct = 90
+cpu_samples = 30
+mem_warn = 90
+mem_crit = 96
+disk_warn = 90
+disk_crit = 97
+temp_crit = 88
+```
+
+Os limiares também podem ser editados na tela **Alertas** ("Editar limiares"): o Pulse reescreve só a
+seção `[alerts]`, preservando comentários e o resto do arquivo, e a mudança vale na hora.
+Linhas inválidas viram avisos (no log do serviço e em `GET /api/config`) e não impedem o daemon de subir.
 
 ## Telas
 
@@ -91,6 +126,7 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 | `GET /api/disk/usage?path=` · `GET /api/disk/cleanup` | espaço em disco |
 | `GET /api/agents` · `GET /api/agents/hooks` · `POST /api/agents/hooks/install` · `POST /api/agents/hook` | agentes |
 | `GET /api/alerts` | alertas ativos, histórico e regras |
+| `GET /api/config` · `POST /api/config/alerts` | configuração efetiva e edição dos limiares |
 
 ## Segurança
 
@@ -100,6 +136,9 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 - O navegador recebe um cookie `HttpOnly; SameSite=Strict`. `GET` aceita cookie ou o cabeçalho
   `X-Pulse-Token`; `POST` **exige** o cabeçalho.
 - `Host` é validado (DNS rebinding) e `Origin`, quando presente, também (CSRF).
+- Após 10 tentativas com token errado em 10 minutos, o IP fica bloqueado por 5 minutos (HTTP 429,
+  registrado como `auth.block` na auditoria); cada falha também atrasa a resposta progressivamente.
+- `pulse --rotate-token` troca o token sem reiniciar o serviço (cookies antigos deixam de valer).
 - Cabeçalhos de segurança: CSP restritiva, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`.
 - Ações sensíveis (sinais em processos, ações em serviços e contêineres, instalação de hooks) vão para
   `~/.local/state/pulse/audit.log` (0600). PID 1 e o próprio Pulse são protegidos; antes do SIGKILL o
@@ -130,7 +169,7 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 
 `LongStore` (`pulse-core::longterm`) agrega as amostras em médias de 60 s (`bucket = ts / 60_000`,
 `ts` em ms), retém 7 dias (10 080 pontos) e grava em `~/.local/state/pulse/history.log`, só-anexar.
-Linhas inválidas são ignoradas ao carregar; quando o arquivo passa de 2× a capacidade, é compactado via
+A retenção é configurável (`[history] retention_days`, até 90 dias). Linhas inválidas são ignoradas ao carregar; quando o arquivo passa de 2× a capacidade, é compactado via
 arquivo temporário + `rename`. Erros de E/S ficam em `/api/health` (`long_error`) e nunca derrubam o daemon.
 
 ## Estrutura
@@ -143,9 +182,19 @@ packaging/            pulse.service, pulse-hook, agents.conf.example, build-deb.
 assets/logo/          marca, ícone de app, versões mono e lockup
 ```
 
+Eventos de hooks e o histórico de alertas também persistem (`hooks.log` e `alerts.log` em
+`~/.local/state/pulse/`, últimos 300 de cada, mesmo esquema só-anexar com compactação) e são recarregados
+ao reiniciar o serviço.
+
 ## Validação
 
-- `cargo test`: 62 testes (coletores com amostras sintéticas, JSON, histórico longo — agregação em ms,
+- CI (GitHub Actions): `cargo fmt --check`, `clippy -D warnings`, testes, sintaxe da UI e dos scripts;
+  depois gera os `.deb` amd64 e arm64, roda `lintian --fail-on warning` e instala/remove o pacote amd64.
+  Em tags `v*`, publica uma Release com os `.deb` e `SHA256SUMS`.
+- `cargo test`: 72 testes unitários + 9 de integração (`crates/pulse-daemon/tests/api.rs`), que sobem o
+  binário real com HOME/XDG temporários e cobrem autenticação, Host/Origin, SSE, persistência entre
+  reinícios, arquivo de configuração, rotação do token, bloqueio por força bruta e a CLI.
+- Antes da Fase 1: 62 testes (coletores com amostras sintéticas, JSON, histórico longo — agregação em ms,
   recarga, linhas inválidas, compactação, falhas de E/S —, alertas, auth, HTTP, hooks, transcrições, cron/Docker).
 - Daemon real: rotas, autenticação (401/421/403), SSE, `--once`, reinício com recarga do histórico longo.
 - Interface conferida em Chromium headless (1440×900, claro/escuro e 390 px): sem erros de JavaScript,

@@ -86,8 +86,17 @@ impl Collector {
         let stat = cpu::read_stat();
         let u = cpu::usage(&self.prev_stat.total, &stat.total);
         let cores_json = json::arr(stat.cores.iter().enumerate().map(|(i, c)| {
-            let pu = self.prev_stat.cores.get(i).map(|p| cpu::usage(p, c).total).unwrap_or(0.0);
-            Obj::new().u("id", i as u64).n("pct", pu).opt_n("mhz", cpu::core_mhz(i)).finish()
+            let pu = self
+                .prev_stat
+                .cores
+                .get(i)
+                .map(|p| cpu::usage(p, c).total)
+                .unwrap_or(0.0);
+            Obj::new()
+                .u("id", i as u64)
+                .n("pct", pu)
+                .opt_n("mhz", cpu::core_mhz(i))
+                .finish()
         }));
         let ctxt_ps = stat.ctxt.saturating_sub(self.prev_ctxt) as f64 / dt;
         let load = cpu::loadavg();
@@ -134,9 +143,18 @@ impl Collector {
             .n("swap_pct", m.swap_pct())
             .opt_n("swappiness", mem::swappiness().map(|x| x as f64))
             .u("oom_kills", vm.oom_kill)
-            .n("swap_in_ps", vm.pswpin.saturating_sub(self.prev_vm.pswpin) as f64 / dt)
-            .n("swap_out_ps", vm.pswpout.saturating_sub(self.prev_vm.pswpout) as f64 / dt)
-            .n("major_faults_ps", vm.pgmajfault.saturating_sub(self.prev_vm.pgmajfault) as f64 / dt)
+            .n(
+                "swap_in_ps",
+                vm.pswpin.saturating_sub(self.prev_vm.pswpin) as f64 / dt,
+            )
+            .n(
+                "swap_out_ps",
+                vm.pswpout.saturating_sub(self.prev_vm.pswpout) as f64 / dt,
+            )
+            .n(
+                "major_faults_ps",
+                vm.pgmajfault.saturating_sub(self.prev_vm.pgmajfault) as f64 / dt,
+            )
             .raw("psi", &psi_json(&psi_m))
             .finish();
         self.prev_vm = vm;
@@ -146,7 +164,9 @@ impl Collector {
         let devs = disk::read_devices();
         let rates = disk::rates(&self.prev_disk, &devs, dt);
         self.prev_disk = devs;
-        let (rd, wr) = rates.iter().fold((0.0, 0.0), |a, r| (a.0 + r.read_bps, a.1 + r.write_bps));
+        let (rd, wr) = rates
+            .iter()
+            .fold((0.0, 0.0), |a, r| (a.0 + r.read_bps, a.1 + r.write_bps));
         let psi_io = cpu::psi("io");
         let disks_json = Obj::new()
             .raw("fs", &json::arr(fs.iter().map(|f| f.to_json())))
@@ -160,8 +180,11 @@ impl Collector {
         let ifs = net::read_ifaces();
         let info = net::iface_info(&self.prev_net, &ifs, dt);
         self.prev_net = ifs;
-        let (rx, tx) = info.iter().filter(|i| !i.virtual_if).fold((0.0, 0.0), |a, i| (a.0 + i.rx_bps, a.1 + i.tx_bps));
-        if self.ticks % 5 == 0 {
+        let (rx, tx) = info
+            .iter()
+            .filter(|i| !i.virtual_if)
+            .fold((0.0, 0.0), |a, i| (a.0 + i.rx_bps, a.1 + i.tx_bps));
+        if self.ticks.is_multiple_of(5) {
             let socks = net::read_sockets();
             let owners = net::socket_owners();
             self.listening = net::listening_json(&socks, &owners);
@@ -187,7 +210,11 @@ impl Collector {
         // Processos
         let plist = self.procs.sample();
         let me = sys::self_pid();
-        let (self_cpu, self_rss) = plist.iter().find(|p| p.pid == me).map(|p| (p.cpu, p.rss)).unwrap_or((0.0, 0));
+        let (self_cpu, self_rss) = plist
+            .iter()
+            .find(|p| p.pid == me)
+            .map(|p| (p.cpu, p.rss))
+            .unwrap_or((0.0, 0));
         let summary = procs::summarize(&plist);
         let top = procs::top(&plist, 8);
         let procs_json = Obj::new()
@@ -236,7 +263,11 @@ fn psi_json(p: &cpu::Psi) -> String {
     if !p.available {
         return "null".into();
     }
-    Obj::new().n("some10", p.some10).n("some60", p.some60).opt_n("full10", p.full10).finish()
+    Obj::new()
+        .n("some10", p.some10)
+        .n("some60", p.some60)
+        .opt_n("full10", p.full10)
+        .finish()
 }
 
 #[cfg(test)]

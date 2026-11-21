@@ -1,0 +1,12 @@
+# bash completion para pulse
+_pulse() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  case "$prev" in
+    --config) COMPREPLY=( $(compgen -f -- "$cur") ); return ;;
+    --port|--interval-ms|--bind) return ;;
+  esac
+  COMPREPLY=( $(compgen -W "--port --bind --allow-remote --interval-ms --notify --no-agents --config --once --print-token --rotate-token --print-config --help" -- "$cur") )
+}
+complete -F _pulse pulse

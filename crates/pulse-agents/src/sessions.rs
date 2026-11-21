@@ -54,13 +54,20 @@ impl Session {
             .b("partial", self.partial)
             .raw(
                 "tools",
-                &json::arr(tools.into_iter().map(|(k, v)| Obj::new().s("name", k).u("n", *v).finish())),
+                &json::arr(
+                    tools
+                        .into_iter()
+                        .map(|(k, v)| Obj::new().s("name", k).u("n", *v).finish()),
+                ),
             );
         if with_timeline {
-            o = o.raw(
-                "timeline",
-                &json::arr(self.timeline.iter().map(|(ts, k, l)| Obj::new().u("ts", *ts).s("kind", k).s("label", l).finish())),
-            );
+            o =
+                o.raw(
+                    "timeline",
+                    &json::arr(self.timeline.iter().map(|(ts, k, l)| {
+                        Obj::new().u("ts", *ts).s("kind", k).s("label", l).finish()
+                    })),
+                );
         }
         o.finish()
     }
@@ -72,7 +79,8 @@ impl Session {
             self.started = ts;
         }
         self.updated = self.updated.max(ts);
-        self.timeline.push((ts, kind.to_string(), label.chars().take(80).collect()));
+        self.timeline
+            .push((ts, kind.to_string(), label.chars().take(80).collect()));
         if self.timeline.len() > TIMELINE * 4 {
             self.timeline.drain(..self.timeline.len() - TIMELINE);
         }
@@ -91,7 +99,14 @@ pub fn parse_iso_ms(s: &str) -> Option<u64> {
         return None;
     }
     let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, se) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    let (y, mo, d, h, mi, se) = (
+        n(0..4)?,
+        n(5..7)?,
+        n(8..10)?,
+        n(11..13)?,
+        n(14..16)?,
+        n(17..19)?,
+    );
     let mut ms = 0i64;
     if b.get(19) == Some(&b'.') {
         let frac: String = s[20..].chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -107,24 +122,40 @@ pub fn parse_iso_ms(s: &str) -> Option<u64> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     let t = ((days * 86_400 + h * 3600 + mi * 60 + se) * 1000) + ms;
-    if t < 0 { None } else { Some(t as u64) }
+    if t < 0 {
+        None
+    } else {
+        Some(t as u64)
+    }
 }
 
 fn ts_of(v: &Value) -> u64 {
-    v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_iso_ms).unwrap_or(0)
+    v.get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(parse_iso_ms)
+        .unwrap_or(0)
 }
 
 fn u(v: Option<&Value>) -> u64 {
-    v.and_then(|x| x.as_f64()).map(|x| x.max(0.0) as u64).unwrap_or(0)
+    v.and_then(|x| x.as_f64())
+        .map(|x| x.max(0.0) as u64)
+        .unwrap_or(0)
 }
 
 fn project_name(cwd: &str) -> String {
-    cwd.trim_end_matches('/').rsplit('/').next().unwrap_or(cwd).to_string()
+    cwd.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(cwd)
+        .to_string()
 }
 
 /// Analisa uma transcrição do Claude Code.
 pub fn parse_claude(src: &str) -> Session {
-    let mut s = Session { agent: "Claude Code".into(), ..Default::default() };
+    let mut s = Session {
+        agent: "Claude Code".into(),
+        ..Default::default()
+    };
     let mut seen_msg: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in src.lines() {
         let Ok(v) = json::parse(line) else { continue };
@@ -149,8 +180,12 @@ pub fn parse_claude(src: &str) -> Session {
                 let is_prompt = match content {
                     Some(Value::Str(_)) => true,
                     Some(Value::Arr(items)) => {
-                        items.iter().any(|i| i.get("type").and_then(|t| t.as_str()) == Some("text"))
-                            && !items.iter().any(|i| i.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+                        items
+                            .iter()
+                            .any(|i| i.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            && !items.iter().any(|i| {
+                                i.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            })
                     }
                     _ => false,
                 };
@@ -160,7 +195,9 @@ pub fn parse_claude(src: &str) -> Session {
                 }
             }
             Some("assistant") => {
-                let Some(msg) = v.get("message") else { continue };
+                let Some(msg) = v.get("message") else {
+                    continue;
+                };
                 if let Some(m) = msg.get("model").and_then(|x| x.as_str()) {
                     if !m.starts_with('<') {
                         s.model = m.to_string();
@@ -168,19 +205,28 @@ pub fn parse_claude(src: &str) -> Session {
                 }
                 // A mesma mensagem da API pode vir dividida em várias linhas:
                 // conta o uso só uma vez por id.
-                let mid = msg.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let mid = msg
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 if mid.is_empty() || seen_msg.insert(mid) {
                     if let Some(us) = msg.get("usage") {
                         s.tokens_in += u(us.get("input_tokens"));
                         s.tokens_out += u(us.get("output_tokens"));
-                        s.tokens_cache += u(us.get("cache_read_input_tokens")) + u(us.get("cache_creation_input_tokens"));
+                        s.tokens_cache += u(us.get("cache_read_input_tokens"))
+                            + u(us.get("cache_creation_input_tokens"));
                     }
                 }
                 if let Some(Value::Arr(items)) = msg.get("content") {
                     for it in items {
                         match it.get("type").and_then(|t| t.as_str()) {
                             Some("tool_use") => {
-                                let name = it.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
+                                let name = it
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("?")
+                                    .to_string();
                                 *s.tools.entry(name.clone()).or_default() += 1;
                                 s.event(ts, "tool", &name);
                             }
@@ -209,7 +255,10 @@ fn dedupe_timeline(s: &mut Session) {
 
 /// Analisa uma transcrição ("rollout") do Codex.
 pub fn parse_codex(src: &str) -> Session {
-    let mut s = Session { agent: "Codex".into(), ..Default::default() };
+    let mut s = Session {
+        agent: "Codex".into(),
+        ..Default::default()
+    };
     for line in src.lines() {
         let Ok(v) = json::parse(line) else { continue };
         let ts = ts_of(&v);
@@ -237,8 +286,15 @@ pub fn parse_codex(src: &str) -> Session {
                     s.project = c.into();
                 }
             }
-            (Some("response_item"), Some("function_call" | "custom_tool_call" | "local_shell_call")) => {
-                let name = p.and_then(|x| x.get("name")).and_then(|x| x.as_str()).unwrap_or("shell").to_string();
+            (
+                Some("response_item"),
+                Some("function_call" | "custom_tool_call" | "local_shell_call"),
+            ) => {
+                let name = p
+                    .and_then(|x| x.get("name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("shell")
+                    .to_string();
                 *s.tools.entry(name.clone()).or_default() += 1;
                 s.event(ts, "tool", &name);
             }
@@ -292,7 +348,9 @@ fn read_capped(path: &Path) -> Option<(String, bool)> {
 }
 
 fn walk_jsonl(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, SystemTime, u64)>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let Ok(md) = e.metadata() else { continue };
@@ -333,8 +391,12 @@ impl Scanner {
         walk_jsonl(&self.codex_dir, 4, &mut x);
         files.extend(x.into_iter().map(|(p, m, l)| (p, m, l, false)));
         let now = SystemTime::now();
-        files.retain(|f| now.duration_since(f.1).map(|d| d < self.max_age).unwrap_or(true));
-        files.sort_by(|a, b| b.1.cmp(&a.1));
+        files.retain(|f| {
+            now.duration_since(f.1)
+                .map(|d| d < self.max_age)
+                .unwrap_or(true)
+        });
+        files.sort_by_key(|f| std::cmp::Reverse(f.1));
         files.truncate(self.max_sessions);
         let mut out = Vec::new();
         let mut keep = std::collections::HashSet::new();
@@ -346,14 +408,26 @@ impl Scanner {
                     continue;
                 }
             }
-            let Some((src, partial)) = read_capped(&path) else { continue };
-            let mut s = if is_claude { parse_claude(&src) } else { parse_codex(&src) };
+            let Some((src, partial)) = read_capped(&path) else {
+                continue;
+            };
+            let mut s = if is_claude {
+                parse_claude(&src)
+            } else {
+                parse_codex(&src)
+            };
             s.partial = partial;
             s.file = path.to_string_lossy().into_owned();
             if s.id.is_empty() {
-                s.id = path.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+                s.id = path
+                    .file_stem()
+                    .map(|x| x.to_string_lossy().into_owned())
+                    .unwrap_or_default();
             }
-            let mt = mtime.duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let mt = mtime
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             s.updated = s.updated.max(mt);
             self.cache.insert(path, (mtime, len, s.clone()));
             out.push(s);
@@ -361,7 +435,7 @@ impl Scanner {
         self.cache.retain(|k, _| keep.contains(k));
         // Sessões sem atividade real (ex.: só metadados) ficam de fora.
         out.retain(|s| s.prompts > 0 || !s.tools.is_empty() || s.tokens_total() > 0);
-        out.sort_by(|a, b| b.updated.cmp(&a.updated));
+        out.sort_by_key(|s| std::cmp::Reverse(s.updated));
         out
     }
 }
@@ -371,7 +445,11 @@ pub fn list_json(list: &[Session]) -> String {
         let o = s.to_json(true);
         // acrescenta o nome curto do projeto
         let short = project_name(&s.project);
-        format!("{},\"project_name\":{}}}", &o[..o.len() - 1], json::quote(&short))
+        format!(
+            "{},\"project_name\":{}}}",
+            &o[..o.len() - 1],
+            json::quote(&short)
+        )
     }))
 }
 
@@ -382,8 +460,14 @@ mod tests {
     #[test]
     fn iso_parse() {
         assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_iso_ms("2023-11-14T22:13:20.5Z"), Some(1_700_000_000_500));
-        assert_eq!(parse_iso_ms("2024-02-29T00:00:00.000Z"), Some(1_709_164_800_000));
+        assert_eq!(
+            parse_iso_ms("2023-11-14T22:13:20.5Z"),
+            Some(1_700_000_000_500)
+        );
+        assert_eq!(
+            parse_iso_ms("2024-02-29T00:00:00.000Z"),
+            Some(1_709_164_800_000)
+        );
         assert_eq!(parse_iso_ms("lixo"), None);
     }
 
