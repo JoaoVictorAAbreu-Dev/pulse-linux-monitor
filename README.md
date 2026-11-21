@@ -16,6 +16,20 @@ pulse --print-token     # imprime a URL de acesso (com o token no fragmento #)
 
 Requisitos: Rust estável (`rustup`), `curl` (para o `pulse-hook`). Sem crates externas.
 
+### Pacote .deb (Ubuntu 24.04+ / Debian com glibc ≥ 2.39)
+
+```sh
+packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.1.0_amd64.deb
+systemctl --user daemon-reload && systemctl --user enable --now pulse
+```
+
+O pacote instala `/usr/bin/pulse`, `/usr/bin/pulse-hook`, `/usr/bin/pulse-open` (abre o painel no
+navegador), o serviço de usuário em `/usr/lib/systemd/user/pulse.service`, o atalho **Pulse** no menu de
+aplicativos e o ícone. O serviço **não** é habilitado automaticamente para todos os usuários.
+Se você também usou o `install.sh`, a unidade em `~/.config/systemd/user/` tem prioridade; remova-a
+(e `~/.local/bin/pulse*`) para usar a versão do pacote.
+
 ## Uso
 
 ```
@@ -125,7 +139,7 @@ arquivo temporário + `rename`. Erros de E/S ficam em `/api/health` (`long_error
 crates/pulse-core     coletores (/proc, /sys, statvfs, systemctl, journalctl), JSON, histórico, alertas
 crates/pulse-agents   detecção de agentes, MCP, transcrições e hooks
 crates/pulse-daemon   HTTP/SSE, autenticação, API e UI embutida (include_str!)
-packaging/            pulse.service, pulse-hook, agents.conf.example
+packaging/            pulse.service, pulse-hook, agents.conf.example, build-deb.sh, deb/
 assets/logo/          marca, ícone de app, versões mono e lockup
 ```
 

@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+# Unidades de usuário ficam a cargo de cada usuário; nada a parar aqui como root.
+exit 0

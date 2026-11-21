@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+  # Recarrega as definições de unidades de usuário das sessões abertas, se possível.
+  # O serviço NÃO é habilitado para todos os usuários: cada um decide.
+  cat <<'MSG'
+
+Pulse instalado. Para iniciar o painel no seu usuário:
+  systemctl --user daemon-reload
+  systemctl --user enable --now pulse
+  pulse --print-token      # ou abra "Pulse" no menu de aplicativos
+
+MSG
+fi
+exit 0

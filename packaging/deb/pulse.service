@@ -1,0 +1,15 @@
+[Unit]
+Description=Pulse — monitor do Ubuntu com painel de agentes de IA
+Documentation=file:///usr/share/doc/pulse-monitor/README.md
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pulse --port 7878
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target

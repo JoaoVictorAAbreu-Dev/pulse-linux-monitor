@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Pulse
+GenericName=Monitor do sistema
+Comment=Monitor do Ubuntu com painel de agentes de IA
+Exec=pulse-open
+Icon=pulse-monitor
+Terminal=false
+Categories=System;Monitor;
+Keywords=monitor;cpu;memória;processos;agentes;claude;codex;
+StartupNotify=false
