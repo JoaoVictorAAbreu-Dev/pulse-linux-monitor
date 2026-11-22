@@ -26,16 +26,22 @@
 </div>
 
 <div class="app">
-  <aside class="sidebar glass" aria-label="Navegação">
+  <aside class="sidebar glass" aria-label="Navegação" data-i18n-aria="Navegação">
     <div class="brand">
       <img src="/favicon.svg" alt="" width="34" height="34">
       <div><strong>Pulse</strong><small id="brand-host">—</small></div>
     </div>
     <nav id="nav"></nav>
-    <div class="theme" role="radiogroup" aria-label="Tema">
-      <button data-theme-opt="auto" role="radio">Auto</button>
-      <button data-theme-opt="light" role="radio">Claro</button>
-      <button data-theme-opt="dark" role="radio">Escuro</button>
+    <div class="side-prefs">
+      <div class="theme" role="radiogroup" aria-label="Tema" data-i18n-aria="Tema">
+        <button data-theme-opt="auto" role="radio" data-i18n="Auto">Auto</button>
+        <button data-theme-opt="light" role="radio" data-i18n="Claro">Claro</button>
+        <button data-theme-opt="dark" role="radio" data-i18n="Escuro">Escuro</button>
+      </div>
+      <div class="theme lang" role="radiogroup" aria-label="Idioma" data-i18n-aria="Idioma">
+        <button data-lang-opt="pt" role="radio" lang="pt-BR" title="Português (Brasil)">PT</button>
+        <button data-lang-opt="en" role="radio" lang="en" title="English">EN</button>
+      </div>
     </div>
   </aside>
 
@@ -43,12 +49,12 @@
     <header class="header glass">
       <div class="title">
         <h1 id="page-title">Pulse</h1>
-        <p id="page-sub">Conectando…</p>
+        <p id="page-sub" data-i18n="Conectando…">Conectando…</p>
       </div>
       <div class="chips">
-        <select class="chip host-sel" id="host-sel" aria-label="Máquina" hidden></select>
+        <select class="chip host-sel" id="host-sel" aria-label="Máquina" data-i18n-aria="Máquina" hidden></select>
         <span class="chip" id="chip-self">Pulse —</span>
-        <a class="chip" id="chip-alerts" href="#/alertas">0 alertas</a>
+        <a class="chip" id="chip-alerts" href="#/alertas" data-i18n="0 alertas">0 alertas</a>
       </div>
     </header>
     <div id="page" class="page" tabindex="-1"></div>

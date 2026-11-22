@@ -104,7 +104,9 @@ impl Reader {
             self.note = None;
             return vec![];
         }
-        if self.available.is_none() {
+        // Só memoriza o "disponível": sem sqlite3, tenta de novo (instalar não
+        // deve exigir reiniciar o serviço; falhar ao executar é barato).
+        if self.available != Some(true) {
             self.available = Some(
                 sys::run_cmd("sqlite3", &["-version"], 3_000)
                     .map(|r| r.0)

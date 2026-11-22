@@ -1,5 +1,6 @@
 //! Consumo por unidade systemd e por contêiner a partir do cgroup v2
-//! (`cpu.stat` → usage_usec, `memory.current`). Não precisa de root nem do Docker.
+//! (`cpu.stat` → usage_usec, `memory.current`). Não precisa de root nem do
+//! Docker/Podman.
 
 use crate::json::{self, Obj};
 use crate::sys;
@@ -9,7 +10,8 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnitUsage {
-    /// Nome da unidade (ex.: `cron.service`, `docker-<id>.scope`).
+    /// Nome da unidade (ex.: `cron.service`, `docker-<id>.scope`,
+    /// `libpod-<id>.scope`).
     pub unit: String,
     /// "system" ou "user".
     pub scope: &'static str,
@@ -36,17 +38,25 @@ pub fn parse_stat_key(src: &str, key: &str) -> Option<u64> {
     })
 }
 
-/// ID do contêiner Docker de uma unidade `docker-<id>.scope`.
-pub fn docker_id(unit: &str) -> Option<&str> {
-    unit.strip_prefix("docker-")?.strip_suffix(".scope")
+/// ID do contêiner de uma unidade `docker-<id>.scope` (Docker) ou
+/// `libpod-<id>.scope` (Podman). `libpod-conmon-<id>.scope` é o monitor do
+/// Podman, não o contêiner.
+pub fn container_id(unit: &str) -> Option<&str> {
+    let id = unit
+        .strip_prefix("docker-")
+        .or_else(|| unit.strip_prefix("libpod-"))?
+        .strip_suffix(".scope")?;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit())).then_some(id)
 }
 
 fn is_unit(name: &str) -> bool {
     name.ends_with(".service") || name.ends_with(".scope")
 }
 
-/// Diretórios de cgroup das unidades: filhos diretos de system.slice e as
-/// unidades do gerenciador do usuário (app.slice, session.slice, background.slice).
+/// Diretórios de cgroup das unidades: filhos diretos de system.slice e
+/// machine.slice (contêineres do Podman como root) e as unidades do
+/// gerenciador do usuário (app.slice, session.slice, background.slice e
+/// user.slice, onde o Podman sem root cria `libpod-<id>.scope`).
 fn unit_dirs(root: &Path, uid: u32) -> Vec<(PathBuf, &'static str)> {
     let mut v = Vec::new();
     let push_children =
@@ -61,8 +71,14 @@ fn unit_dirs(root: &Path, uid: u32) -> Vec<(PathBuf, &'static str)> {
             }
         };
     push_children(root.join("system.slice"), "system", &mut v);
+    push_children(root.join("machine.slice"), "system", &mut v);
     let user = root.join(format!("user.slice/user-{uid}.slice/user@{uid}.service"));
-    for s in ["app.slice", "session.slice", "background.slice"] {
+    for s in [
+        "app.slice",
+        "session.slice",
+        "background.slice",
+        "user.slice",
+    ] {
         push_children(user.join(s), "user", &mut v);
     }
     // apps gráficos ficam em sub-slices (app-gnome-*.slice/…)
@@ -154,7 +170,7 @@ pub fn usage_json(v: &[UnitUsage]) -> String {
             .opt_n("cpu", u.cpu_pct)
             .u("mem", u.mem)
             .u("tasks", u.tasks)
-            .opt_s("container", docker_id(&u.unit))
+            .opt_s("container", container_id(&u.unit))
             .finish()
     }))
 }
@@ -175,8 +191,14 @@ mod tests {
             Some(7)
         );
         assert_eq!(parse_stat_key("anon 10\n", "inactive_file"), None);
-        assert_eq!(docker_id("docker-abc123.scope"), Some("abc123"));
-        assert_eq!(docker_id("cron.service"), None);
+        assert_eq!(container_id("docker-abc123.scope"), Some("abc123"));
+        assert_eq!(
+            container_id("libpod-b0c6c16c289a.scope"),
+            Some("b0c6c16c289a")
+        );
+        assert_eq!(container_id("libpod-conmon-b0c6c16c289a.scope"), None);
+        assert_eq!(container_id("docker.service"), None);
+        assert_eq!(container_id("cron.service"), None);
     }
 
     #[test]
@@ -188,7 +210,12 @@ mod tests {
         let useru = root.join(format!(
             "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/app-x.slice/pulse.service"
         ));
-        for d in [&sysu, &useru] {
+        // Podman sem root (user@UID.service/user.slice) e como root (machine.slice)
+        let rootless = root.join(format!(
+            "user.slice/user-{uid}.slice/user@{uid}.service/user.slice/libpod-aaa111.scope"
+        ));
+        let rootful = root.join("machine.slice/libpod-bbb222.scope");
+        for d in [&sysu, &useru, &rootless, &rootful] {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(d.join("cpu.stat"), "usage_usec 1000000\n").unwrap();
             std::fs::write(d.join("memory.current"), "5096\n").unwrap();
@@ -198,7 +225,13 @@ mod tests {
         let mut s = CgroupSampler::new(&root);
         assert!(s.available());
         let first = s.sample();
-        assert_eq!(first.len(), 2);
+        assert_eq!(first.len(), 4);
+        let pods: Vec<(&str, &str)> = first
+            .iter()
+            .filter_map(|u| Some((container_id(&u.unit)?, u.scope)))
+            .collect();
+        assert!(pods.contains(&("aaa111", "user")) && pods.contains(&("bbb222", "system")));
+        assert!(usage_json(&first).contains("\"container\":\"aaa111\""));
         assert!(first.iter().all(|u| u.cpu_pct.is_none()));
         std::fs::write(sysu.join("cpu.stat"), "usage_usec 3000000\n").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));

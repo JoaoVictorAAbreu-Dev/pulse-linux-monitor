@@ -34,4 +34,18 @@
     <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/pulse-monitor/pulse-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">netprobe</annotate>
   </action>
+
+  <action id="io.github.pulse-monitor.smart">
+    <description>Read disk health (SMART) with smartctl</description>
+    <description xml:lang="pt_BR">Ler a saúde dos discos (SMART) com o smartctl</description>
+    <message>Authentication is required for Pulse to read the SMART health data of a disk</message>
+    <message xml:lang="pt_BR">O Pulse precisa da sua senha para ler os dados de saúde (SMART) de um disco</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/pulse-monitor/pulse-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">smart</annotate>
+  </action>
 </policyconfig>

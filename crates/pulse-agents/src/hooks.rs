@@ -365,13 +365,188 @@ pub fn codex_snippet(script: &str) -> String {
     )
 }
 
-/// `notify` do Codex já aponta para o pulse-hook?
+/// Região de topo de um `config.toml` (chaves antes da primeira `[tabela]`).
+#[derive(Debug, PartialEq)]
+struct TomlTop {
+    /// Índice da primeira linha de cabeçalho de tabela (ou o total de linhas).
+    end: usize,
+    /// Linha logo após a última instrução da região de topo.
+    after_last: usize,
+    /// Texto (sem comentários) do `notify` de topo, se houver.
+    notify: Option<String>,
+}
+
+/// Código de uma linha sem o comentário, e a variação de profundidade de
+/// colchetes fora de strings (strings de uma linha só; as multilinha são
+/// recusadas antes).
+fn toml_code(line: &str) -> (String, i32) {
+    let mut out = String::new();
+    let mut depth = 0;
+    let mut quote: Option<char> = None;
+    let mut esc = false;
+    for c in line.chars() {
+        match quote {
+            Some(q) => {
+                if esc {
+                    esc = false;
+                } else if c == '\\' && q == '"' {
+                    esc = true;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '#' => break,
+                '"' | '\'' => quote = Some(c),
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            },
+        }
+        out.push(c);
+    }
+    (out, depth)
+}
+
+fn is_notify_key(code: &str) -> bool {
+    let t = code.trim_start();
+    let rest = t
+        .strip_prefix("notify")
+        .or_else(|| t.strip_prefix("\"notify\""))
+        .or_else(|| t.strip_prefix("'notify'"));
+    rest.map(|r| r.trim_start().starts_with('='))
+        .unwrap_or(false)
+}
+
+/// Analisa a região de topo. Erro se houver strings multilinha (não dá para
+/// saber com segurança onde as instruções terminam).
+fn toml_top(lines: &[&str]) -> Result<TomlTop, String> {
+    let mut depth = 0i32;
+    let mut after_last = 0;
+    let mut notify: Option<String> = None;
+    let mut in_notify = false;
+    for (i, line) in lines.iter().enumerate() {
+        if depth <= 0 && line.trim_start().starts_with('[') {
+            return Ok(TomlTop {
+                end: i,
+                after_last,
+                notify,
+            });
+        }
+        if line.contains("\"\"\"") || line.contains("'''") {
+            return Err(
+                "o início do config.toml tem strings multilinha (\"\"\" ou '''); adicione a linha do notify manualmente"
+                    .into(),
+            );
+        }
+        let (code, d) = toml_code(line);
+        if code.trim().is_empty() && depth <= 0 {
+            continue;
+        }
+        if depth <= 0 {
+            in_notify = is_notify_key(&code);
+            if in_notify {
+                if notify.is_some() {
+                    return Err("o config.toml tem mais de um notify; nada foi alterado".into());
+                }
+                notify = Some(String::new());
+            }
+        }
+        if in_notify {
+            if let Some(n) = notify.as_mut() {
+                n.push_str(&code);
+                n.push('\n');
+            }
+        }
+        depth = (depth + d).max(0);
+        after_last = i + 1;
+    }
+    Ok(TomlTop {
+        end: lines.len(),
+        after_last,
+        notify,
+    })
+}
+
+/// Adiciona o `notify` do Pulse ao `~/.codex/config.toml`, só na região de
+/// topo. Idempotente; recusa (sem tocar no arquivo) se já houver outro
+/// `notify` ou se o topo tiver strings multilinha. Faz backup
+/// (`config.toml.pulse-bak`) e grava de forma atômica preservando as permissões.
+/// Retorna (alterou?, caminho do backup se houve).
+pub fn install_codex(config: &Path, script: &str) -> Result<(bool, Option<String>), String> {
+    // arquivo gerenciado por link simbólico (dotfiles): grava no destino
+    let config = std::fs::canonicalize(config).unwrap_or_else(|_| config.to_path_buf());
+    let config = config.as_path();
+    let existing = match std::fs::read_to_string(config) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("não foi possível ler {}: {}", config.display(), e)),
+    };
+    let src = existing.clone().unwrap_or_default();
+    let mut lines: Vec<&str> = src.split_inclusive('\n').collect();
+    let top = toml_top(&lines)?;
+    if let Some(n) = &top.notify {
+        if n.contains("pulse-hook") {
+            return Ok((false, None));
+        }
+        return Err(
+            "o config.toml já tem um notify de outro programa; nada foi alterado (o Codex aceita só um notify)"
+                .into(),
+        );
+    }
+    let ours = format!("{}\n", codex_snippet(script));
+    let at = top.after_last;
+    let mut fixed_prev = String::new();
+    if at > 0 && !lines[at - 1].ends_with('\n') {
+        fixed_prev = format!("{}\n", lines[at - 1]);
+    }
+    if !fixed_prev.is_empty() {
+        lines[at - 1] = &fixed_prev;
+    }
+    let mut insert = vec![ours.as_str()];
+    if at < lines.len() && !lines[at].trim().is_empty() {
+        insert.push("\n");
+    }
+    let body: String = lines[..at]
+        .iter()
+        .chain(insert.iter())
+        .chain(lines[at..].iter())
+        .copied()
+        .collect();
+    let perms = std::fs::metadata(config).ok().map(|m| m.permissions());
+    let mut backup = None;
+    if existing.is_some() {
+        let b = config.with_extension("toml.pulse-bak");
+        // copy preserva as permissões do original (o arquivo pode ter tokens)
+        std::fs::copy(config, &b).map_err(|e| format!("falha no backup: {}", e))?;
+        backup = Some(b.to_string_lossy().into_owned());
+    }
+    if let Some(dir) = config.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let tmp = config.with_extension("toml.pulse-tmp");
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    if let Some(p) = perms {
+        std::fs::set_permissions(&tmp, p).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, config).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
+    Ok((true, backup))
+}
+
+/// `notify` de topo do Codex já aponta para o pulse-hook? (comentários e
+/// chaves dentro de tabelas não contam)
 pub fn codex_status(config: &Path) -> bool {
-    std::fs::read_to_string(config)
-        .map(|s| {
-            s.lines()
-                .any(|l| l.trim_start().starts_with("notify") && l.contains("pulse-hook"))
-        })
+    let Ok(s) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    let lines: Vec<&str> = s.split_inclusive('\n').collect();
+    toml_top(&lines)
+        .ok()
+        .and_then(|t| t.notify)
+        .map(|n| n.contains("pulse-hook"))
         .unwrap_or(false)
 }
 
@@ -519,6 +694,121 @@ mod tests {
         std::fs::write(&f, "{ruim").unwrap();
         assert!(install_claude(&f, "/x/pulse-hook").is_err());
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "{ruim");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    fn codex_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pulse-codex-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const HOOK: &str = "/usr/bin/pulse-hook";
+
+    #[test]
+    fn codex_missing_and_empty() {
+        let dir = codex_dir("novo");
+        let f = dir.join(".codex/config.toml");
+        assert!(!codex_status(&f));
+        assert_eq!(install_codex(&f, HOOK).unwrap(), (true, None));
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            format!("{}\n", codex_snippet(HOOK))
+        );
+        assert!(codex_status(&f));
+        assert!(!dir.join(".codex/config.toml.pulse-tmp").exists());
+        // vazio: grava, com backup do arquivo (vazio) original
+        std::fs::write(&f, "").unwrap();
+        let (changed, backup) = install_codex(&f, HOOK).unwrap();
+        assert!(changed && backup.is_some());
+        assert!(codex_status(&f));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_tables_idempotent_backup_and_perms() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = codex_dir("tabelas");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.toml");
+        let orig = "# Codex\nmodel = \"gpt-5\"\nsandbox = [\n  \"a\",\n  [1, 2],\n]\n\n# perfis\n[profiles.x]\nnotify = [\"outro\"]\n[[mcp]]\nname = \"m\"\n";
+        std::fs::write(&f, orig).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!codex_status(&f), "notify dentro de tabela não conta");
+        let (changed, backup) = install_codex(&f, HOOK).unwrap();
+        assert!(changed);
+        let b = backup.unwrap();
+        assert!(b.ends_with("config.toml.pulse-bak"));
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), orig);
+        let now = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(
+            now,
+            format!(
+                "# Codex\nmodel = \"gpt-5\"\nsandbox = [\n  \"a\",\n  [1, 2],\n]\n{}\n\n# perfis\n[profiles.x]\nnotify = [\"outro\"]\n[[mcp]]\nname = \"m\"\n",
+                codex_snippet(HOOK)
+            )
+        );
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(codex_status(&f));
+        // segunda vez: nada muda, sem novo backup
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(install_codex(&f, HOOK).unwrap(), (false, None));
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), now);
+        assert!(!std::path::Path::new(&b).exists());
+        // sem quebra de linha final e tabela logo no início
+        std::fs::write(&f, "model = \"x\"").unwrap();
+        install_codex(&f, HOOK).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            format!("model = \"x\"\n{}\n", codex_snippet(HOOK))
+        );
+        std::fs::write(&f, "[tui]\nx = 1\n").unwrap();
+        install_codex(&f, HOOK).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            format!("{}\n\n[tui]\nx = 1\n", codex_snippet(HOOK))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn codex_foreign_notify_and_comments() {
+        let dir = codex_dir("alheio");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("config.toml");
+        for src in [
+            "model = \"x\"\nnotify = [\"notify-send\", \"Codex\"]\n",
+            "notify = [\n  \"python3\",\n  \"/home/u/notify.py\",\n]\n[tui]\n",
+            "\"notify\" = [\"x\"]\n",
+            "a = \"\"\"\nmulti\n\"\"\"\n",
+        ] {
+            std::fs::write(&f, src).unwrap();
+            assert!(install_codex(&f, HOOK).is_err(), "{}", src);
+            assert_eq!(std::fs::read_to_string(&f).unwrap(), src, "intocado");
+            assert!(!dir.join("config.toml.pulse-bak").exists());
+            assert!(!codex_status(&f));
+        }
+        // notify multilinha que já é o do Pulse: ok sem escrever
+        let ours = format!(
+            "notify = [\n  \"{}\",\n  \"aguardando\", \"codex\",\n]\n",
+            HOOK
+        );
+        std::fs::write(&f, &ours).unwrap();
+        assert!(codex_status(&f));
+        assert_eq!(install_codex(&f, HOOK).unwrap(), (false, None));
+        // comentário com notify não conta e não bloqueia
+        let c = "# notify = [\"/usr/bin/pulse-hook\"]\nmodel = \"x\" # notify = 1\n";
+        std::fs::write(&f, c).unwrap();
+        assert!(!codex_status(&f));
+        assert!(install_codex(&f, HOOK).unwrap().0);
+        assert!(std::fs::read_to_string(&f).unwrap().starts_with(&format!(
+            "{}{}\n",
+            c,
+            codex_snippet(HOOK)
+        )));
+        assert!(codex_status(&f));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

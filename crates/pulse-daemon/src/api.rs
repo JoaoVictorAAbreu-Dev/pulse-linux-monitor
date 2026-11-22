@@ -473,6 +473,10 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
             let devs: Vec<String> = disk::read_devices().into_iter().map(|d| d.0).collect();
             Response::ok_json(pulse_core::smart::smart_json(&devs))
         }
+        ("POST", "/api/disk/smart/privileged") => match body_json(req) {
+            Err(r) => r,
+            Ok(v) => smart_privileged(str_field(&v, "device").unwrap_or(""), peer),
+        },
         ("GET", "/api/cgroups") => {
             let mut cg = sh.cgroups.lock().unwrap_or_else(|e| e.into_inner());
             if !cg.available() {
@@ -555,29 +559,14 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
             Err(r) => r,
             Ok(v) => config_agents(sh, &v, peer),
         },
-        ("POST", "/api/agents/hooks/install") => {
-            let settings = sys::home().join(".claude/settings.json");
-            let script = hook_script_path();
-            let res = hooks::install_claude(&settings, &script);
-            auth::audit(
-                "hooks.install",
-                &settings.to_string_lossy(),
-                res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
-                peer,
-            );
-            match res {
-                Ok((added, backup)) => Response::ok_json(
-                    Obj::new()
-                        .b("ok", true)
-                        .raw("added", &json::arr(added.iter().map(|s| json::quote(s))))
-                        .opt_s("backup", backup.as_deref())
-                        .s("script", &script)
-                        .b("script_exists", std::path::Path::new(&script).exists())
-                        .finish(),
-                ),
-                Err(e) => Response::error(409, &e),
-            }
-        }
+        ("POST", "/api/agents/hooks/install") => match body_json(req) {
+            Err(r) => r,
+            Ok(v) => match str_field(&v, "agent").unwrap_or("claude") {
+                "claude" => install_claude_hooks(peer),
+                "codex" => install_codex_hook(peer),
+                _ => Response::error(400, "agent deve ser \"claude\" ou \"codex\""),
+            },
+        },
         ("POST", "/api/agents/hook") => {
             let agent = req.header("x-pulse-agent").unwrap_or("claude").to_string();
             let state = req.header("x-pulse-state").unwrap_or("").to_string();
@@ -694,6 +683,104 @@ fn du_route(sh: &Arc<Shared>, req: &Request) -> Response {
     )
 }
 
+fn install_claude_hooks(peer: &str) -> Response {
+    let settings = sys::home().join(".claude/settings.json");
+    let script = hook_script_path();
+    let res = hooks::install_claude(&settings, &script);
+    auth::audit(
+        "hooks.install",
+        &settings.to_string_lossy(),
+        res.as_ref().map(|_| "ok").unwrap_or_else(|e| e),
+        peer,
+    );
+    match res {
+        Ok((added, backup)) => Response::ok_json(
+            Obj::new()
+                .b("ok", true)
+                .s("agent", "claude")
+                .b("changed", !added.is_empty())
+                .raw("added", &json::arr(added.iter().map(|s| json::quote(s))))
+                .opt_s("backup", backup.as_deref())
+                .s("path", &settings.to_string_lossy())
+                .s("script", &script)
+                .b("script_exists", std::path::Path::new(&script).exists())
+                .finish(),
+        ),
+        Err(e) => Response::error(409, &e),
+    }
+}
+
+/// `notify` do Codex em ~/.codex/config.toml (só na região de topo).
+fn install_codex_hook(peer: &str) -> Response {
+    let config = sys::home().join(".codex/config.toml");
+    let script = hook_script_path();
+    let res = hooks::install_codex(&config, &script);
+    auth::audit(
+        "hooks.install.codex",
+        &config.to_string_lossy(),
+        res.as_ref()
+            .map(|(changed, _)| if *changed { "ok" } else { "já instalado" })
+            .unwrap_or_else(|e| e),
+        peer,
+    );
+    match res {
+        Ok((changed, backup)) => Response::ok_json(
+            Obj::new()
+                .b("ok", true)
+                .s("agent", "codex")
+                .b("changed", changed)
+                .raw("added", if changed { "[\"notify\"]" } else { "[]" })
+                .opt_s("backup", backup.as_deref())
+                .s("path", &config.to_string_lossy())
+                .s("script", &script)
+                .b("script_exists", std::path::Path::new(&script).exists())
+                .finish(),
+        ),
+        Err(e) => Response::error(409, &e),
+    }
+}
+
+/// SMART de um disco com senha: `pkexec pulse-helper smart <disco>`.
+fn smart_privileged(dev: &str, peer: &str) -> Response {
+    if !pulse_core::smart::valid_device(dev) {
+        return Response::error(
+            400,
+            "device deve ser o nome de um disco (ex.: sda, nvme0n1)",
+        );
+    }
+    if !disk::read_devices().iter().any(|d| d.0 == dev) {
+        return Response::error(404, "disco não encontrado");
+    }
+    if !std::path::Path::new(services::HELPER).exists() {
+        return Response::error(
+            501,
+            "a leitura com senha precisa do pulse-helper, instalado pelo pacote .deb",
+        );
+    }
+    let (status, body) = match sys::run_cmd("pkexec", &[services::HELPER, "smart", dev], 180_000) {
+        // o smartctl sai com bits ligados mesmo com resultado: vale o JSON
+        Ok((_, out, _)) if out.trim_start().starts_with('{') => {
+            let h = pulse_core::smart::parse_smartctl(dev, &out);
+            (
+                h.error.clone().unwrap_or_else(|| "ok".into()),
+                Response::ok_json(
+                    Obj::new()
+                        .b("ok", true)
+                        .raw("disk", &pulse_core::smart::health_obj(&h))
+                        .finish(),
+                ),
+            )
+        }
+        Ok((_, _, err)) => {
+            let e = services::pkexec_error(&err);
+            (e.clone(), Response::error(502, &e))
+        }
+        Err(e) => (e.clone(), Response::error(502, &e)),
+    };
+    auth::audit("disk.smart", dev, &status, peer);
+    body
+}
+
 /// Caminho do script de hook: ao lado do binário ou em ~/.local/bin.
 pub fn hook_script_path() -> String {
     if let Ok(exe) = std::env::current_exe() {
@@ -714,6 +801,7 @@ fn hooks_info() -> Response {
     let settings = sys::home().join(".claude/settings.json");
     let script = hook_script_path();
     let connected = hooks::claude_status(&settings);
+    let codex_config = sys::home().join(".codex/config.toml");
     Response::ok_json(
         Obj::new()
             .s("settings", &settings.to_string_lossy())
@@ -726,10 +814,8 @@ fn hooks_info() -> Response {
             .u("total_events", hooks::CLAUDE_EVENTS.len() as u64)
             .s("snippet", &hooks::claude_snippet(&script))
             .s("codex_snippet", &hooks::codex_snippet(&script))
-            .b(
-                "codex_connected",
-                hooks::codex_status(&sys::home().join(".codex/config.toml")),
-            )
+            .s("codex_config", &codex_config.to_string_lossy())
+            .b("codex_connected", hooks::codex_status(&codex_config))
             .finish(),
     )
 }

@@ -900,3 +900,87 @@ fn units_allow_pkexec() {
         assert!(!unit.lines().any(|l| l.trim() == "NoNewPrivileges=yes"));
     }
 }
+
+#[test]
+fn codex_hook_install_and_smart_validation() {
+    let env = Env::new("codex");
+    let d = start(&env, &[]);
+    let tok = env.token();
+    let h = [("X-Pulse-Token", tok.as_str())];
+    let cfg = env.root.join("home/.codex/config.toml");
+    let install = |body: &str| req(&d, "POST", "/api/agents/hooks/install", &h, body);
+
+    // primeira vez: cria o arquivo; segunda: idempotente
+    let (st, _, b) = install(r#"{"agent":"codex"}"#);
+    assert_eq!(st, 200, "{}", b);
+    let v = j(&b);
+    assert_eq!(v.get("agent").and_then(|x| x.as_str()), Some("codex"));
+    assert_eq!(v.get("changed").and_then(|x| x.as_bool()), Some(true));
+    let first = std::fs::read_to_string(&cfg).unwrap();
+    assert!(first.starts_with("notify = [") && first.contains("pulse-hook"));
+    let (st, _, b) = install(r#"{"agent":"codex"}"#);
+    assert_eq!(st, 200, "{}", b);
+    assert_eq!(j(&b).get("changed").and_then(|x| x.as_bool()), Some(false));
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), first);
+    let (_, _, b) = req(&d, "GET", "/api/agents/hooks", &h, "");
+    assert_eq!(
+        j(&b).get("codex_connected").and_then(|x| x.as_bool()),
+        Some(true)
+    );
+
+    // notify de outro programa: erro e arquivo intocado
+    let foreign = "model = \"x\"\nnotify = [\"notify-send\", \"Codex\"]\n[tui]\n";
+    std::fs::write(&cfg, foreign).unwrap();
+    let (st, _, b) = install(r#"{"agent":"codex"}"#);
+    assert_eq!(st, 409, "{}", b);
+    assert!(b.contains("notify"));
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), foreign);
+    let (_, _, b) = req(&d, "GET", "/api/agents/hooks", &h, "");
+    assert_eq!(
+        j(&b).get("codex_connected").and_then(|x| x.as_bool()),
+        Some(false)
+    );
+
+    // agente desconhecido; corpo vazio continua instalando no Claude Code
+    assert_eq!(install(r#"{"agent":"x"}"#).0, 400);
+    let (st, _, b) = install("");
+    assert_eq!(st, 200, "{}", b);
+    assert_eq!(j(&b).get("agent").and_then(|x| x.as_str()), Some("claude"));
+    assert!(env.root.join("home/.claude/settings.json").exists());
+
+    let audit = std::fs::read_to_string(env.state().join("audit.log")).unwrap();
+    assert!(audit.contains("action=hooks.install.codex"));
+
+    // SMART com senha: nome inválido e disco inexistente param antes do pkexec
+    // (o teste não depende de o pulse-helper estar instalado ou não)
+    for body in [r#"{"device":"../sda"}"#, r#"{"device":""}"#, "{}"] {
+        assert_eq!(
+            req(&d, "POST", "/api/disk/smart/privileged", &h, body).0,
+            400,
+            "{}",
+            body
+        );
+    }
+    assert_eq!(
+        req(
+            &d,
+            "POST",
+            "/api/disk/smart/privileged",
+            &h,
+            r#"{"device":"pulsenaoexiste9"}"#
+        )
+        .0,
+        404
+    );
+    assert_eq!(
+        req(
+            &d,
+            "POST",
+            "/api/disk/smart/privileged",
+            &[],
+            r#"{"device":"sda"}"#
+        )
+        .0,
+        401
+    );
+}

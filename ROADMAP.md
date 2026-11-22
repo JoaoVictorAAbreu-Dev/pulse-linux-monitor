@@ -75,7 +75,8 @@ Claude Code real (testados com payloads de exemplo).
 séries no formato do Prometheus; ntfy e webhook entregues a um receptor HTTP local; o Chromium não aponta
 erros de instalabilidade da PWA; `pulse-tray` registrado na bandeja do GNOME e com menu via D-Bus;
 comparação "hoje × ontem" desenhada. De bônus, o alocador do glibc foi ajustado (`mallopt`) e o RSS do
-daemon caiu de ~90 MB para ~6 MB. **Pendente:** 4.5 (inglês), e Telegram/Discord reais não testados.
+daemon caiu de ~90 MB para ~6 MB. **Atualização (22/11/2026):** 4.5 (inglês) concluído na v0.6.0 (veja
+[Fechamento](#fechamento-v060)). **Pendente:** Telegram/Discord reais não testados.
 O `pulse-tray` usa Python + D-Bus porque o GTK3 aborta neste GNOME 50 (esquema de configurações
 incompatível).
 
@@ -85,7 +86,7 @@ incompatível).
 | 4.2 | **Webhooks/ntfy para alertas** | P | Além do desktop, enviar para ntfy.sh/Discord/Telegram (URL no config, segredo fora do log). |
 | 4.3 | **PWA + atalhos de teclado** | P | Manifest e ícones para "instalar" o painel como app; `g c` = CPU, `/` = busca, etc. |
 | 4.4 | **Bandeja do sistema** | G | Indicador GNOME (AppIndicator via `pulse-tray` separado) com CPU/memória e estado dos agentes; sem trazer GTK para o daemon. |
-| 4.5 | **Interface em inglês** | M | Strings da UI num dicionário; `pt-BR` continua padrão. Amplia o alcance do repositório público. |
+| 4.5 | **Interface em inglês** ✅ v0.6.0 | M | Strings da UI num dicionário; `pt-BR` continua padrão. Amplia o alcance do repositório público. |
 | 4.6 | **Comparar períodos** | M | Sobrepor "hoje × ontem" no gráfico do histórico longo; útil para achar regressões de consumo. |
 
 ## Fase 5 — Exploratório
@@ -118,6 +119,45 @@ Ideias originais:
 - **Multi-máquina**: um Pulse "central" agregando outros via túnel SSH (nunca expor sem TLS).
 - **eBPF opcional** (binário separado com capacidades) para tráfego de rede por processo e latência de disco.
 - **SQLite** só se as consultas do histórico ficarem complexas demais para arquivos texto.
+
+## Fechamento (v0.6.0)
+
+**Status (22/11/2026):** implementado no código ainda não lançado da v0.6.0. Validado localmente com
+`cargo test --all` (113 testes unitários + 15 de integração). O que depende do pacote instalado está
+indicado em cada item.
+
+- **4.5 Interface bilíngue (pt-BR/inglês)** — seletor PT | EN na barra lateral; padrão pelo idioma do
+  navegador; escolha salva em `localStorage` (`pulse.lang`); números e datas no locale escolhido;
+  mensagens fixas do backend traduzidas na UI. Continuam em pt-BR os erros repassados de comandos externos
+  (`systemctl`, `smartctl`, `docker`) e as notificações do daemon (desktop, ntfy, webhook).
+- **Podman** — o Pulse usa o `docker` se ele responder, senão o `podman` (CLI); `/api/containers` ganhou
+  o campo `engine`. O cgroup reconhece `libpod-<id>.scope` (root em `machine.slice`, sem root em
+  `user@UID.service/user.slice`). Testado com o podman 4.9.3 num contêiner (lista, parar e iniciar);
+  CPU/memória pelo cgroup do Podman não verificada (o contêiner de teste não tinha o controlador de
+  memória).
+- **Hooks do Codex com instalação automática** — botão **Conectar Codex** /
+  `POST /api/agents/hooks/install` com `{"agent":"codex"}`. Mexe só no topo de `~/.codex/config.toml`,
+  com backup `config.toml.pulse-bak` e escrita atômica; recusa (409) se já houver outro `notify` ou
+  strings multilinha no topo; idempotente. Auditoria `hooks.install.codex`. Coberto por teste de
+  integração.
+- **eBPF com UDP recebido** — kretprobe em `udp_recvmsg`/`udpv6_recvmsg`. UDP IPv6 enviado
+  (`udpv6_sendmsg`) não é contado, para evitar contagem dupla.
+- **SMART com senha** — discos com `needs_root` mostram **Ler com senha** →
+  `POST /api/disk/smart/privileged` `{"device":"sda"}` → `pkexec pulse-helper smart` (nova ação polkit
+  `io.github.pulse-monitor.smart`); respostas 400/404/501/502; auditoria `disk.smart`. `/api/disk/smart`
+  ganhou `privileged` e `needs_root`. Testado com o helper como root num contêiner (leu um SSD real) e
+  com um `pkexec` simulado. **A janela de senha real será conferida depois de instalar a 0.6.0.**
+- **OpenClaw** — o Pulse detecta o `sqlite3` instalado sem reiniciar o serviço. Leitura verificada nos
+  bancos reais (a consulta devolveu sessões com modelo e nº de mensagens); o painel mostra só sessões dos
+  últimos 3 dias.
+- **Helper polkit (registro)** — o bloqueio do `pkexec` pelo `NoNewPrivileges` foi resolvido na 0.5.1 e
+  conferido com o pacote instalado; saiu das limitações do README.
+
+Ficou de fora:
+
+- Telegram e Discord contra os serviços reais (ainda sem bot/webhook; só receptor local). Para testar:
+  cadastrar em **Alertas → Canais externos** e usar **Testar**.
+- Várias máquinas com uma segunda máquina física (só testado com daemons locais e contêiner com `sshd`).
 
 ---
 

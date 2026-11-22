@@ -236,19 +236,129 @@ pub struct Container {
     pub compose: String,
 }
 
-/// Saída de `docker ps -a --format '{{json .}}'` (um objeto por linha).
+/// Motor de contêineres: "docker" se `docker version` responde, senão
+/// "podman". Só a escolha que funcionou fica em cache (um daemon do Docker
+/// iniciado depois do Pulse ainda é detectado).
+pub fn engine() -> &'static str {
+    static ENGINE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    if let Some(e) = ENGINE.get() {
+        return e;
+    }
+    let works = |prog: &str, fmt: &str| {
+        matches!(
+            sys::run_cmd(prog, &["version", "--format", fmt], 5_000),
+            Ok((true, _, _))
+        )
+    };
+    if works("docker", "{{.Server.Version}}") {
+        return ENGINE.get_or_init(|| "docker");
+    }
+    if works("podman", "{{.Client.Version}}") {
+        return ENGINE.get_or_init(|| "podman");
+    }
+    // nenhum responde: sem Docker instalado mas com Podman, o erro do Podman
+    // é o mais útil; nos demais casos, o do Docker
+    if sys::run_cmd("docker", &["--version"], 3_000).is_err()
+        && sys::run_cmd("podman", &["--version"], 3_000).is_ok()
+    {
+        "podman"
+    } else {
+        "docker"
+    }
+}
+
+fn engine_label(engine: &str) -> &'static str {
+    if engine == "podman" {
+        "Podman"
+    } else {
+        "Docker"
+    }
+}
+
+/// Lê objetos JSON de um por linha (`{{json .}}`) ou de um array (`--format json`).
+fn json_items(src: &str) -> Vec<Value> {
+    let t = src.trim();
+    if t.starts_with('[') {
+        return match json::parse(t) {
+            Ok(Value::Arr(v)) => v,
+            _ => vec![],
+        };
+    }
+    t.lines().filter_map(|l| json::parse(l).ok()).collect()
+}
+
+fn first_str(v: &Value, keys: &[&str]) -> String {
+    keys.iter()
+        .find_map(|k| v.get(k).and_then(|x| x.as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Portas no formato do Docker ("0.0.0.0:8080->80/tcp, …"); o Podman manda
+/// uma lista de objetos.
+fn ports_text(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Arr(list)) => list
+            .iter()
+            .map(|p| {
+                let n = |k: &str| p.get(k).and_then(|x| x.as_f64()).unwrap_or(0.0) as u64;
+                let ip = p.get("host_ip").and_then(|x| x.as_str()).unwrap_or("");
+                let proto = p.get("protocol").and_then(|x| x.as_str()).unwrap_or("tcp");
+                let (host, cont, range) = (n("host_port"), n("container_port"), n("range").max(1));
+                let span = |a: u64| {
+                    if range > 1 {
+                        format!("{}-{}", a, a + range - 1)
+                    } else {
+                        a.to_string()
+                    }
+                };
+                let ip = if ip.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}:", ip)
+                };
+                if host == 0 {
+                    format!("{}/{}", span(cont), proto)
+                } else {
+                    format!("{}{}->{}/{}", ip, span(host), span(cont), proto)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => String::new(),
+    }
+}
+
+/// Projeto do Compose (Docker Compose ou podman-compose) pelos rótulos, que
+/// vêm como texto "k=v,k=v" (Docker) ou objeto (Podman).
+fn compose_project(v: Option<&Value>) -> String {
+    const KEYS: [&str; 2] = ["com.docker.compose.project", "io.podman.compose.project"];
+    match v {
+        Some(Value::Str(s)) => s
+            .split(',')
+            .find_map(|kv| {
+                let (k, val) = kv.split_once('=')?;
+                KEYS.contains(&k).then(|| val.to_string())
+            })
+            .unwrap_or_default(),
+        Some(o @ Value::Obj(_)) => KEYS
+            .iter()
+            .find_map(|k| o.get(k).and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Saída de `docker ps -a --format '{{json .}}'` (um objeto por linha) ou de
+/// `podman ps -a --format json` (array; `Id`, `Names` lista, `Labels` objeto).
 pub fn parse_docker_ps(src: &str) -> Vec<Container> {
-    src.lines()
-        .filter_map(|l| json::parse(l).ok())
+    json_items(src)
+        .iter()
         .map(|v| {
-            let g = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let labels = g("Labels");
-            let compose = labels
-                .split(',')
-                .find_map(|kv| kv.strip_prefix("com.docker.compose.project="))
-                .unwrap_or("")
-                .to_string();
-            let status = g("Status");
+            let g = |k: &str| first_str(v, &[k]);
+            let mut status = g("Status");
             let mut state = g("State");
             if state.is_empty() {
                 state = if status.starts_with("Up") {
@@ -257,94 +367,130 @@ pub fn parse_docker_ps(src: &str) -> Vec<Container> {
                     "exited".into()
                 };
             }
+            if status.is_empty() {
+                // podman `{{json .}}` deixa Status vazio
+                let mut c = state.chars();
+                status = c
+                    .next()
+                    .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                    .unwrap_or_default();
+            }
+            let name = match v.get("Names") {
+                Some(Value::Arr(a)) => a
+                    .iter()
+                    .filter_map(|x| x.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                _ => g("Names"),
+            };
+            // Docker: CreatedAt é a data; Podman: Created (segundos Unix ou
+            // data) e CreatedAt relativo ("2 hours ago")
+            let created = match v.get("Created") {
+                Some(Value::Num(n)) => n
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|x| *x > 0.0)
+                    .map(|x| sys::iso_utc(x as u64 * 1000))
+                    .unwrap_or_default(),
+                Some(Value::Str(s)) if !s.is_empty() => s.clone(),
+                _ => g("CreatedAt"),
+            };
+            let mut id = first_str(v, &["ID", "Id"]);
+            id.truncate(12);
             Container {
-                id: g("ID"),
-                name: g("Names"),
+                id,
+                name,
                 image: g("Image"),
                 state,
                 status,
-                ports: g("Ports"),
-                created: g("CreatedAt"),
-                compose,
+                ports: ports_text(v.get("Ports")),
+                created,
+                compose: compose_project(v.get("Labels")),
             }
         })
         .filter(|c| !c.id.is_empty())
         .collect()
 }
 
-/// `docker stats --no-stream`: id curto → (CPU %, uso de memória em texto).
+/// `docker stats --no-stream` (`ID`, `CPUPerc`, `MemUsage`) ou
+/// `podman stats --no-stream --format json` (`id`, `cpu_percent`, `mem_usage`):
+/// id curto → (CPU %, uso de memória em texto).
 pub fn parse_docker_stats(src: &str) -> Vec<(String, f64, String)> {
-    src.lines()
-        .filter_map(|l| json::parse(l).ok())
+    json_items(src)
+        .iter()
         .filter_map(|v| {
-            let id = v.get("ID").and_then(|x| x.as_str())?.to_string();
-            let cpu = v
-                .get("CPUPerc")
-                .and_then(|x| x.as_str())
-                .and_then(|s| s.trim_end_matches('%').parse().ok())
+            let id = first_str(v, &["ID", "id"]);
+            if id.is_empty() {
+                return None;
+            }
+            let cpu = first_str(v, &["CPUPerc", "cpu_percent"])
+                .trim_end_matches('%')
+                .parse()
                 .unwrap_or(0.0);
-            let mem = v
-                .get("MemUsage")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            Some((id, cpu, mem))
+            Some((id, cpu, first_str(v, &["MemUsage", "mem_usage"])))
         })
         .collect()
 }
 
 pub fn containers_json(with_stats: bool) -> String {
-    let available = sys::run_cmd(
-        "docker",
-        &["version", "--format", "{{.Server.Version}}"],
-        5_000,
-    );
-    let (ok, version, err) = match available {
+    let eng = engine();
+    let label = engine_label(eng);
+    let unavailable = |msg: &str| {
+        Obj::new()
+            .b("available", false)
+            .s("engine", eng)
+            .s("error", msg)
+            .raw("containers", "[]")
+            .finish()
+    };
+    let fmt = if eng == "podman" {
+        "{{.Client.Version}}"
+    } else {
+        "{{.Server.Version}}"
+    };
+    let (ok, version, err) = match sys::run_cmd(eng, &["version", "--format", fmt], 5_000) {
         Ok(x) => x,
-        Err(e) => {
-            return Obj::new()
-                .b("available", false)
-                .s("error", &e)
-                .raw("containers", "[]")
-                .finish()
-        }
+        Err(_) => return unavailable("nem o Docker nem o Podman estão instalados"),
     };
     if !ok {
-        let msg = if err.contains("permission denied") {
-            "sem permissão no socket do Docker (adicione o usuário ao grupo docker)".to_string()
+        let msg = if err.to_lowercase().contains("permission denied") {
+            if eng == "docker" {
+                "sem permissão no socket do Docker (adicione o usuário ao grupo docker)".to_string()
+            } else {
+                "sem permissão para falar com o Podman".to_string()
+            }
         } else {
             err.lines()
-                .next()
-                .unwrap_or("Docker indisponível")
-                .to_string()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| l.to_string())
+                .unwrap_or_else(|| format!("{} indisponível", label))
         };
-        return Obj::new()
-            .b("available", false)
-            .s("error", &msg)
-            .raw("containers", "[]")
-            .finish();
+        return unavailable(&msg);
     }
-    let list = match sys::run_cmd(
-        "docker",
-        &["ps", "-a", "--no-trunc=false", "--format", "{{json .}}"],
-        10_000,
-    ) {
+    let ps: &[&str] = if eng == "podman" {
+        &["ps", "-a", "--format", "json"]
+    } else {
+        &["ps", "-a", "--no-trunc=false", "--format", "{{json .}}"]
+    };
+    let list = match sys::run_cmd(eng, ps, 10_000) {
         Ok((_, out, _)) => parse_docker_ps(&out),
         Err(_) => vec![],
     };
     let stats = if with_stats && list.iter().any(|c| c.state == "running") {
-        sys::run_cmd(
-            "docker",
-            &["stats", "--no-stream", "--format", "{{json .}}"],
-            15_000,
-        )
-        .map(|(_, o, _)| parse_docker_stats(&o))
-        .unwrap_or_default()
+        let fmt = if eng == "podman" {
+            "json"
+        } else {
+            "{{json .}}"
+        };
+        sys::run_cmd(eng, &["stats", "--no-stream", "--format", fmt], 15_000)
+            .map(|(_, o, _)| parse_docker_stats(&o))
+            .unwrap_or_default()
     } else {
         vec![]
     };
     Obj::new()
         .b("available", true)
+        .s("engine", eng)
         .s("version", version.trim())
         .raw(
             "containers",
@@ -385,7 +531,7 @@ pub fn container_action(verb: &str, id: &str) -> Result<String, String> {
     if !valid_container(id) {
         return Err("identificador de contêiner inválido".into());
     }
-    let (ok, out, err) = sys::run_cmd("docker", &[verb, "--", id], 60_000)?;
+    let (ok, out, err) = sys::run_cmd(engine(), &[verb, "--", id], 60_000)?;
     if ok {
         Ok(out.trim().to_string())
     } else {
@@ -399,8 +545,9 @@ pub fn container_logs(id: &str, lines: u32) -> Result<String, String> {
         return Err("identificador de contêiner inválido".into());
     }
     let n = lines.clamp(10, 2000).to_string();
+    let eng = engine();
     let (ok, out, err) = sys::run_cmd(
-        "docker",
+        eng,
         &["logs", "--tail", &n, "--timestamps", "--", id],
         15_000,
     )?;
@@ -408,10 +555,10 @@ pub fn container_logs(id: &str, lines: u32) -> Result<String, String> {
         return Err(err
             .lines()
             .next()
-            .unwrap_or("docker logs falhou")
-            .to_string());
+            .map(|l| l.to_string())
+            .unwrap_or_else(|| format!("{} logs falhou", eng)));
     }
-    // docker logs escreve o stderr do contêiner no stderr: junta os dois
+    // docker/podman logs escrevem o stderr do contêiner no stderr: junta os dois
     let mut all: Vec<&str> = out.lines().chain(err.lines()).collect();
     all.sort(); // linhas começam com o horário RFC 3339
     let mut text = all.join("\n");
@@ -469,6 +616,44 @@ mod tests {
             "{\"ID\":\"1bad7bde7443\",\"CPUPerc\":\"1.25%\",\"MemUsage\":\"20MiB / 1GiB\"}\n",
         );
         assert_eq!(st[0].1, 1.25);
+    }
+
+    #[test]
+    fn podman_ps_and_stats_real_output() {
+        // saída real do podman 4.9.3 (Ubuntu 24.04): `ps -a --format json`
+        let c = parse_docker_ps(include_str!("../testdata/podman-ps.json"));
+        assert_eq!(c.len(), 2);
+        let web = c.iter().find(|c| c.name == "web").unwrap();
+        assert_eq!(web.id, "b0c6c16c289a");
+        assert_eq!(web.state, "running");
+        assert!(web.status.starts_with("Up"));
+        assert_eq!(web.compose, "demo");
+        assert_eq!(web.ports, "8080->80/tcp");
+        assert_eq!(web.image, "docker.io/library/alpine:latest");
+        assert!(web.created.starts_with("2026-"), "{}", web.created);
+        let done = c.iter().find(|c| c.name == "done").unwrap();
+        assert_eq!((done.state.as_str(), done.compose.as_str()), ("exited", ""));
+        assert_eq!(done.ports, "");
+        // `ps -a --format '{{json .}}'`: Status e CreatedAt vêm vazios
+        let l = parse_docker_ps(include_str!("../testdata/podman-ps-lines.json"));
+        assert_eq!(l.len(), 2);
+        let web = l.iter().find(|c| c.name == "web").unwrap();
+        assert_eq!(
+            (web.state.as_str(), web.status.as_str()),
+            ("running", "Running")
+        );
+        assert!(web.created.starts_with("2026-"));
+        assert_eq!(web.compose, "demo");
+        // `stats --no-stream --format json`
+        let st = parse_docker_stats(include_str!("../testdata/podman-stats.json"));
+        assert_eq!(st.len(), 1);
+        assert_eq!(st[0].0, "b0c6c16c289a");
+        assert_eq!(st[0].1, 0.05);
+        assert_eq!(st[0].2, "0B / 14.06GB");
+        assert_eq!(
+            ports_text(json::parse(r#"[{"host_ip":"127.0.0.1","container_port":5000,"host_port":5000,"range":2,"protocol":"udp"}]"#).ok().as_ref()),
+            "127.0.0.1:5000-5001->5000-5001/udp"
+        );
     }
 
     #[test]

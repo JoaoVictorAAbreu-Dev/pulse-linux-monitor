@@ -37,7 +37,7 @@ um painel web local em `http://127.0.0.1:7878`.
 ## Destaques
 
 - **Sistema inteiro numa tela**: CPU, GPU, memória, swap, discos, processos, serviços systemd, timers,
-  cron, contêineres Docker, rede, logs e alertas, com histórico de até 90 dias.
+  cron, contêineres Docker ou Podman, rede, logs e alertas, com histórico de até 90 dias.
 - **Painel de agentes de IA**: Claude Code, Codex e OpenClaw/"Ponto", com servidores MCP, sessões,
   ritmo, latência por ferramenta, tokens por dia, custo estimado e eventos ao vivo por hooks.
 - **Privacidade**: das transcrições só saem metadados; o texto de pedidos, respostas e argumentos de
@@ -48,6 +48,8 @@ um painel web local em `http://127.0.0.1:7878`.
   o que exige root passa por um helper próprio via `pkexec`/polkit.
 - **Integrações**: `/metrics` para Prometheus/Grafana, notificações (desktop, ntfy, webhook, Discord,
   Telegram), PWA, ícone na bandeja e várias máquinas (somente leitura) por túnel SSH.
+- **Interface em português ou inglês**: seletor PT | EN na barra lateral, com números e datas no formato
+  do idioma escolhido.
 
 ## Instalação rápida
 
@@ -56,12 +58,12 @@ Pacote `.deb` para **Ubuntu 24.04+ / Debian com glibc ≥ 2.39**, em amd64 e arm
 
 ```sh
 # 1. Baixe o pacote (troque amd64 por arm64 se for o caso) e confira o checksum
-curl -LO https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor/releases/download/v0.5.1/pulse-monitor_0.5.1_amd64.deb
-curl -LO https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor/releases/download/v0.5.1/SHA256SUMS
+curl -LO https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor/releases/download/v0.6.0/pulse-monitor_0.6.0_amd64.deb
+curl -LO https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor/releases/download/v0.6.0/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 
 # 2. Instale e habilite o serviço de usuário
-sudo apt install ./pulse-monitor_0.5.1_amd64.deb
+sudo apt install ./pulse-monitor_0.6.0_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 
 # 3. Abra o painel
@@ -83,8 +85,9 @@ O serviço **não** é habilitado automaticamente para todos os usuários: cada 
 
 Dependências do pacote: `systemd` e `python3`. Recomendados: `curl` (usado pelo `pulse-hook` e pelas
 notificações externas), `libnotify-bin` (`notify-send`) e `python3-gi` (`pulse-tray`). Sugeridos, para
-recursos opcionais: `docker.io`, `xdg-utils`, `bpftrace`, `smartmontools` e `openssh-client`. As sessões
-do OpenClaw usam o programa `sqlite3`, se instalado.
+recursos opcionais: `docker.io`, `xdg-utils`, `bpftrace`, `smartmontools` e `openssh-client`. O Podman
+também serve no lugar do Docker. As sessões do OpenClaw usam o programa `sqlite3`, se instalado (o Pulse
+percebe a instalação sem reiniciar o serviço).
 
 </details>
 
@@ -110,10 +113,11 @@ prioridade; remova-a (e `~/.local/bin/pulse*`) para usar a versão do pacote.
    (`#token=…`); a interface o troca por um cookie e limpa a barra de endereço.
 2. Navegue pelas telas com o menu ou com o teclado: `g` + `v/c/m/d/p/s/r/l/a/x` troca de tela, `/` busca,
    `t` alterna o tema e `?` mostra a ajuda.
-3. Na tela **Agentes**, use **Conectar hooks** para receber eventos do Claude Code ao vivo (detalhes em
-   [Agentes de IA](#agentes-de-ia)).
-4. Na tela **Alertas**, ajuste os limiares ("Editar limiares") e, se quiser, os canais externos.
-5. Opcional: `pulse-tray --install-autostart` coloca o ícone na bandeja a cada sessão, e no
+3. Escolha o idioma no seletor **PT | EN** da barra lateral (o padrão segue o idioma do navegador).
+4. Na tela **Agentes**, use **Conectar hooks** para receber eventos do Claude Code ao vivo e, no mesmo
+   diálogo, **Conectar Codex** (detalhes em [Agentes de IA](#agentes-de-ia)).
+5. Na tela **Alertas**, ajuste os limiares ("Editar limiares") e, se quiser, os canais externos.
+6. Opcional: `pulse-tray --install-autostart` coloca o ícone na bandeja a cada sessão, e no
    Chrome/Brave/Edge dá para instalar o painel como app (PWA).
 
 Comandos úteis:
@@ -142,7 +146,7 @@ flowchart LR
   subgraph Fontes["Fontes do sistema"]
     K["/proc, /sys, statvfs"]
     S["systemctl, journalctl"]
-    X["docker, smartctl, nvidia-smi"]
+    X["docker/podman, smartctl, nvidia-smi"]
     T["transcrições e hooks dos agentes"]
   end
   subgraph Daemon["pulse (usuário, loopback)"]
@@ -161,14 +165,15 @@ flowchart LR
   A --> W
   W -->|"127.0.0.1:7878 + token"| B["navegador / PWA / pulse-tray / Prometheus"]
   W -->|"pkexec + polkit"| P["pulse-helper (root)"]
-  P --> PS["systemctl / bpftrace"]
+  P --> PS["systemctl / bpftrace / smartctl"]
 ```
 
 - **Coleta**: o daemon roda como seu usuário e amostra o sistema no intervalo configurado (padrão
   1000 ms, mínimo 250 ms). Recursos opcionais chamam comandos externos só quando existem.
 - **Entrega**: a UI estática fica embutida no binário; os dados chegam pela API JSON e por SSE
   (`event: snapshot` a cada amostra e `event: hook` para eventos de agentes).
-- **Privilégios**: o que exige root (ações em serviços do sistema e a medição eBPF) passa pelo
+- **Privilégios**: o que exige root (ações em serviços do sistema, a medição eBPF e a leitura SMART com
+  senha) passa pelo
   `pulse-helper` via `pkexec`, com senha pedida pelo polkit. Veja [Segurança](#segurança).
 - **Persistência**: arquivos só-anexar em `~/.local/state/pulse/`, sem banco de dados.
 
@@ -197,9 +202,9 @@ flowchart LR
 | 1 | **Visão geral** | KPIs (CPU, memória, swap, disco, rede ↓/↑, temperatura), gráfico CPU/memória, alertas, maiores consumidores, agentes agora e armazenamento |
 | 2 | **CPU** | histórico, usuário/sistema/iowait, carga, PSI, governor, núcleos e sensores; **GPU** e **energia** |
 | 3 | **Memória** | composição, swap, PSI, mortes por OOM e **quem está na swap** |
-| 4 | **Discos** | sistemas de arquivos, dispositivos, **SMART** opcional, explorador de espaço e candidatos à limpeza |
+| 4 | **Discos** | sistemas de arquivos, dispositivos, **SMART** opcional (com leitura com senha), explorador de espaço e candidatos à limpeza |
 | 5 | **Processos** | tabela ou árvore, E/S por processo, encerrar/pausar/continuar/renice com confirmação |
-| 6 | **Serviços** | systemd de usuário e de sistema, timers, CPU/memória por unidade, cron e contêineres Docker |
+| 6 | **Serviços** | systemd de usuário e de sistema, timers, CPU/memória por unidade, cron e contêineres Docker/Podman |
 | 7 | **Rede** | tráfego, conexões TCP, interfaces, portas em escuta e **tráfego por processo (eBPF)** sob demanda |
 | 8 | **Logs** | journalctl (sistema/usuário) com filtros, busca e "seguir" |
 | 9 | **Agentes** | processos de agentes, MCP, sessões, ritmo, latência, tokens, custo e eventos ao vivo |
@@ -218,7 +223,8 @@ flowchart LR
    PSI, histórico, maiores consumidores e `VmSwap` por processo.
 4. **Discos** — uso e inodes por sistema de arquivos; throughput, IOPS e ocupação por dispositivo; gráfico
    de throughput; **saúde SMART** opcional (via `smartctl`, sob demanda; o número de série nunca é
-   exposto); explorador "o que ocupa espaço?" **em segundo plano** (com progresso, cache de 5 min e
+   exposto; discos negados por falta de permissão ganham o botão **Ler com senha**, que lê só aquele disco
+   pelo `pulse-helper` com a janela de senha do polkit); explorador "o que ocupa espaço?" **em segundo plano** (com progresso, cache de 5 min e
    prioridade baixa) e candidatos à limpeza (**apenas listados com o comando sugerido; o Pulse nunca os
    executa**).
 5. **Processos** — tabela filtrável/ordenável com **E/S de disco por processo** (`/proc/PID/io`) e
@@ -229,12 +235,15 @@ flowchart LR
    filtrada pela unidade. No escopo do sistema as ações passam pelo `pulse-helper` via `pkexec` (janela de
    senha do polkit, autorização mantida por alguns minutos). Cron: crontab do usuário, `/etc/crontab`,
    `/etc/cron.d` e `cron.{daily,...}`, com variáveis ocultas e senhas/tokens mascarados. Contêineres
-   Docker: estado, portas, CPU/memória sob demanda (ou pelo cgroup, sem `docker stats`), **logs do
-   contêiner** e iniciar/parar/reiniciar com confirmação e auditoria.
+   (Docker, ou Podman quando o `docker` não responde): estado, portas, CPU/memória sob demanda (ou pelo
+   cgroup, sem `docker stats`), **logs do contêiner** e iniciar/parar/reiniciar com confirmação e
+   auditoria. O cgroup reconhece `docker-<id>.scope` e `libpod-<id>.scope` (Podman como root em
+   `machine.slice` e sem root em `user@UID.service/user.slice`).
 7. **Rede** — ↓/↑, conexões TCP por estado, interfaces e portas em escuta com processo dono e marca
    "só local" / "acessível na rede"; **tráfego por processo (eBPF)**: 5, 10 ou 30 s de medição com
    `bpftrace` (bytes TCP/UDP enviados e recebidos por processo e latência média/máxima dos discos), com
-   senha via polkit.
+   senha via polkit. UDP recebido vem do retorno de `udp_recvmsg`/`udpv6_recvmsg`; UDP enviado por IPv6
+   (`udpv6_sendmsg`) não é contado.
 8. **Logs** — journalctl (sistema/usuário), unidade, prioridade, nº de linhas, busca e "seguir".
 9. **Agentes** — veja [Agentes de IA](#agentes-de-ia).
 10. **Alertas** — ativos, regras, histórico, edição dos limiares, canais externos e status da notificação
@@ -264,12 +273,16 @@ modelo, e eventos ao vivo por hooks (subagentes, falhas de ferramenta, pedidos d
   `pulse-hook` para `UserPromptSubmit`/`PreToolUse` (executando), `PermissionRequest`/`Notification`
   (pedindo atenção), `PostToolUseFailure` (falha de ferramenta), `SubagentStart`/`SubagentStop`
   (subagentes), `Stop` (aguardando) e `SessionEnd` (concluído).
-- **Codex**: o diálogo mostra a linha `notify = ["…/pulse-hook", "aguardando", "codex"]` para o início de
-  `~/.codex/config.toml` (o Codex passa o JSON como argumento; o `pulse-hook` aceita os dois formatos).
-  O Pulse não edita esse TOML sozinho.
+- **Hooks do Codex**: o botão **Conectar Codex** (no mesmo diálogo) grava
+  `notify = ["…/pulse-hook", "aguardando", "codex"]` no topo de `~/.codex/config.toml` (antes da primeira
+  `[tabela]`; o resto do arquivo não é tocado). Faz backup `config.toml.pulse-bak`, grava de forma atômica
+  preservando as permissões e é idempotente. Se já houver outro `notify` no topo, ou strings multilinha
+  ali, recusa sem alterar nada e mostra o motivo (HTTP 409). O Codex passa o JSON como argumento; o
+  `pulse-hook` aceita os dois formatos. A linha continua exibida para quem preferir colar à mão.
 - **OpenClaw**: as sessões ficam em SQLite (`~/.openclaw/agents/*/agent/openclaw-agent.sqlite`) e são
-  lidas em modo somente leitura pelo programa `sqlite3`, se instalado (`sudo apt install sqlite3`); só
-  janela da sessão, contagem de mensagens e modelo.
+  lidas em modo somente leitura pelo programa `sqlite3`, se instalado (`sudo apt install sqlite3`; o Pulse
+  detecta a instalação sem reiniciar o serviço); só janela da sessão, contagem de mensagens e modelo, das
+  sessões dos últimos 3 dias.
 - **Outros agentes**: `echo '{"session_id":"x"}' | pulse-hook aguardando openclaw`. O script nunca
   bloqueia o agente (tempo limite de 2 s, sai sempre com 0) e passa o token ao `curl` pela entrada padrão,
   não pela linha de comando.
@@ -337,6 +350,15 @@ temp_crit = 88          # °C
 - Outras seções: `[agents]` e `[prices]` ([Agentes de IA](#agentes-de-ia)), `[notify]` e `[remote.NOME]`
   ([Integrações](#integrações)).
 
+### Idioma da interface
+
+A interface está em português do Brasil e em inglês. O seletor **PT | EN** na barra lateral troca o idioma
+na hora; a escolha fica no navegador (`localStorage`, chave `pulse.lang`) e, sem escolha salva, o padrão
+segue o idioma do navegador (português se for `pt-*`, senão inglês). Números e datas usam o formato do
+idioma escolhido, e as mensagens fixas do daemon (erros e avisos da API) são traduzidas na própria UI.
+Continuam em pt-BR: erros repassados de comandos externos (`systemctl`, `smartctl`, `docker`…) e as
+notificações enviadas pelo daemon (desktop, ntfy, webhook).
+
 ## Integrações
 
 ### Prometheus / Grafana
@@ -393,8 +415,9 @@ token = "<conteúdo de ~/.config/pulse/token no servidor>"
 
 ### Hooks de agentes
 
-O `pulse-hook` recebe eventos do Claude Code (instalação pelo botão **Conectar hooks**), do Codex (linha
-`notify` para colar) e de qualquer outro agente que consiga chamar um comando. Detalhes em
+O `pulse-hook` recebe eventos do Claude Code (instalação pelo botão **Conectar hooks**), do Codex
+(botão **Conectar Codex**, ou a linha `notify` para colar) e de qualquer outro agente que consiga chamar
+um comando. Detalhes em
 [Agentes de IA](#agentes-de-ia).
 
 ## Segurança
@@ -411,14 +434,16 @@ O `pulse-hook` recebe eventos do Claude Code (instalação pelo botão **Conecta
 - A URL de `--print-token` leva o token no fragmento (`#token=…`), que não é enviado ao servidor; a UI o
   troca por um cookie e limpa a barra de endereço.
 - Cabeçalhos de segurança: CSP restritiva, `X-Frame-Options: DENY`, `nosniff`, `no-referrer`.
-- Ações sensíveis (sinais em processos, ações em serviços e contêineres, instalação de hooks) vão para
-  `~/.local/state/pulse/audit.log` (0600). PID 1 e o próprio Pulse são protegidos; antes do SIGKILL o
+- Ações sensíveis (sinais em processos, ações em serviços e contêineres, instalação de hooks do Claude
+  Code e do Codex — `hooks.install` e `hooks.install.codex` — e leitura SMART com senha — `disk.smart`)
+  vão para `~/.local/state/pulse/audit.log` (0600). PID 1 e o próprio Pulse são protegidos; antes do SIGKILL o
   Pulse confere se o PID não foi reutilizado.
 - **Privilégios**: o daemon roda como seu usuário. O que exige root passa pelo `pulse-helper`
   (`/usr/libexec/pulse-monitor/`), executado via `pkexec` com a política
-  `io.github.pulse-monitor.policy` (`auth_admin_keep`, só sessão ativa). O helper aceita apenas
-  `unit start|stop|restart <nome>.service` e `netprobe <1..30>` (script bpftrace fixo), limpa o ambiente e
-  chama `/usr/bin/systemctl` e `/usr/bin/bpftrace` por caminho absoluto. Por isso o `pulse.service` não
+  `io.github.pulse-monitor.policy` (ações `manage-units`, `netprobe` e `smart`; `auth_admin_keep`, só
+  sessão ativa). O helper aceita apenas `unit start|stop|restart <nome>.service`, `netprobe <1..30>`
+  (script bpftrace fixo) e `smart <disco>` (nome só com letras e números, e precisa ser um dispositivo de
+  bloco em `/dev`), limpa o ambiente e chama `systemctl`, `bpftrace` e `smartctl` por caminho absoluto. Por isso o `pulse.service` não
   usa `NoNewPrivileges` (o `pkexec` é setuid).
 - **Máquinas remotas**: o túnel liga `127.0.0.1` local a `127.0.0.1` remoto (nada exposto na rede), o
   repasse só aceita `GET` em `/api/…` e usa o token da outra máquina, nunca o seu.
@@ -442,12 +467,14 @@ e `POST /api/logout`.
 | `GET /api/logs?scope=&unit=&priority=&lines=&q=&cursor=` | journald |
 | `GET /api/timers?scope=user\|system` · `GET /api/cron` | agendamentos |
 | `GET /api/cgroups` | CPU/memória por unidade systemd e contêiner (cgroup v2) |
-| `GET /api/containers[?stats=1]` · `POST /api/containers/action` | Docker |
+| `GET /api/containers[?stats=1]` · `POST /api/containers/action` | contêineres Docker ou Podman (campo `engine`: `docker`\|`podman`) |
 | `GET /api/containers/logs?id=&lines=` | últimas linhas de log de um contêiner |
 | `GET /api/disk/usage?path=&refresh=1` | explorador de espaço em segundo plano (`pending` + progresso, depois o resultado) |
 | `GET /api/disk/cleanup` | candidatos à limpeza (só listados) |
-| `GET /api/disk/smart` | saúde dos discos via `smartctl` (opcional) |
-| `GET /api/agents` · `GET /api/agents/hooks` · `POST /api/agents/hooks/install` · `POST /api/agents/hook` | agentes |
+| `GET /api/disk/smart` | saúde dos discos via `smartctl` (opcional); `privileged` diz se o helper está instalado e cada disco traz `needs_root` |
+| `POST /api/disk/smart/privileged` `{"device":"sda"}` | SMART de um disco com senha (`pkexec pulse-helper smart`); 400 nome inválido, 404 disco inexistente, 501 sem o helper, 502 falha do pkexec/helper |
+| `GET /api/agents` · `GET /api/agents/hooks` · `POST /api/agents/hook` | agentes, estado dos hooks e recebimento de eventos |
+| `POST /api/agents/hooks/install` `{"agent":"claude"\|"codex"}` | instala os hooks do Claude Code (padrão, também com corpo vazio) ou o `notify` do Codex; 409 se não for seguro alterar |
 | `GET /api/alerts` | alertas ativos, histórico e regras |
 | `GET /api/config` · `POST /api/config/alerts` | configuração efetiva e edição dos limiares |
 | `POST /api/config/agents` | grava `[agents]` e `[prices]` (tela Preferências) |
@@ -472,7 +499,7 @@ Gerar o `.deb` localmente (usa `dpkg-deb` e `fakeroot`, sem `cargo-deb`):
 packaging/build-deb.sh                                      # target/deb/pulse-monitor_<versão>_<arq>.deb
 packaging/build-deb.sh --no-build                           # empacota o binário já compilado
 packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
-sudo apt install ./target/deb/pulse-monitor_0.5.1_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.6.0_amd64.deb
 ```
 
 Princípios do projeto (do [ROADMAP](ROADMAP.md)): só biblioteca padrão no daemon (dependências opcionais
@@ -484,11 +511,13 @@ auditoria, e nunca expor conteúdo de conversas dos agentes.
 - **CI (GitHub Actions)**: `cargo fmt --check`, `clippy -D warnings`, testes, sintaxe da UI e dos
   scripts; depois gera os `.deb` amd64 e arm64, roda `lintian --fail-on warning` e instala/remove o pacote
   amd64. Em tags `v*`, publica uma Release com os `.deb` e `SHA256SUMS`.
-- **`cargo test`**: 108 testes unitários + 14 de integração (`crates/pulse-daemon/tests/api.rs`), que
+- **`cargo test`**: 113 testes unitários + 15 de integração (`crates/pulse-daemon/tests/api.rs`), que
   sobem o binário real com HOME/XDG temporários e cobrem autenticação, Host/Origin, SSE, persistência
-  entre reinícios, arquivo de configuração, rotação do token, bloqueio por força bruta, a CLI e o repasse
+  entre reinícios, arquivo de configuração, rotação do token, bloqueio por força bruta, a CLI, o repasse
   para outra máquina (dois daemons: GET com query, SSE, POST → 405, máquina desconhecida → 404, token
-  remoto nunca exposto).
+  remoto nunca exposto), a instalação do `notify` do Codex (idempotente e recusada diante de outro
+  `notify`) e a validação da leitura SMART com senha (nome inválido e disco inexistente param antes do
+  `pkexec`).
 - **Daemon real**: rotas, autenticação (401/421/403), SSE, `--once`, reinício com recarga do histórico
   longo.
 - **Interface**: conferida em Chromium headless (1440×900, claro/escuro e 390 px): sem erros de
@@ -501,43 +530,48 @@ Antes da Fase 1 eram 62 testes (coletores com amostras sintéticas, JSON, histó
 ms, recarga, linhas inválidas, compactação, falhas de E/S —, alertas, auth, HTTP, hooks, transcrições,
 cron/Docker). O status de validação de cada fase está no [ROADMAP](ROADMAP.md).
 
+Helper polkit: na 0.5.0 o `pkexec` falhava ("must be setuid root") por causa do `NoNewPrivileges=yes` no
+`pulse.service`; a 0.5.1 resolveu, e em 22/11/2026 a janela de senha e o helper foram conferidos com o
+pacote instalado (reiniciar o `cron` e medição eBPF).
+
 </details>
 
 ## Limitações conhecidas
 
 O que **não** foi feito ou **não** foi testado de ponta a ponta:
 
-- **Interface em inglês (roadmap 4.5)**: ainda não; a UI é só em pt-BR.
 - **Tauri**: não há app nativo; a interface web pode ser instalada como PWA e há o `pulse-tray`
   (Python + D-Bus).
 - **SQLite**: decisão de **não usar** (veja a Fase 5 do [ROADMAP](ROADMAP.md)): as consultas do histórico
   continuam simples e os arquivos texto bastam.
 - **Sem TLS**: pensado para loopback (veja [Segurança](#segurança)).
 - **Telegram e Discord**: implementados, mas só testados com um receptor HTTP local (formato das
-  requisições), não contra os serviços reais. O ntfy e o webhook JSON foram testados de ponta a ponta com
-  um receptor local.
-- **SMART**: implementado via `smartctl`, mas **não testado em hardware real** (o smartmontools não está
-  instalado na máquina de desenvolvimento; só o parser foi testado com saídas de exemplo). Ler SMART
-  normalmente exige root ou o grupo `disk`.
+  requisições), não contra os serviços reais (ainda não há bot do Telegram nem webhook do Discord para o
+  teste). Para conferir com os seus: cadastre o canal em **Alertas → Canais externos** e use **Testar**.
+  O ntfy e o webhook JSON foram testados de ponta a ponta com um receptor local.
+- **SMART**: ler SMART normalmente exige root ou o grupo `disk`. O `pulse-helper` rodando como root (num
+  contêiner) leu um SSD real, e o caminho daemon → `pkexec` → helper foi testado com um `pkexec` simulado.
+  **Ainda falta conferir** a janela de senha real do polkit com a 0.6.0 instalada (nova ação
+  `io.github.pulse-monitor.smart`).
 - **RAPL e bateria**: o consumo da CPU só aparece se `/sys/class/powercap/intel-rapl:0/energy_uj` for
   legível; em kernels recentes ele é restrito ao root. Bateria só testada com dados de exemplo (máquina
   desktop).
-- **eBPF**: só sob demanda (não é contínuo) e só TCP/UDP enviados (`tcp_sendmsg`/`udp_sendmsg`) e TCP
-  recebidos (`tcp_cleanup_rbuf`); UDP recebido fica de fora. Precisa do pacote `bpftrace` e de root (via
-  polkit). Testado em contêiner privilegiado no kernel 7.0.
-- **Helper polkit**: o helper foi testado direto como root (num contêiner). Com a 0.5.0 instalada, o
-  `pkexec` falhou com "pkexec must be setuid root" porque o `pulse.service` tinha `NoNewPrivileges=yes`;
-  a 0.5.1 tira essa opção (e, se o pkexec continuar bloqueado, as ações em serviços caem no `systemctl`,
-  que pede autorização ao polkit pelo D-Bus). Conferido em 22/11/2026 com a 0.5.1 instalada no Ubuntu: a
-  janela de senha abriu e o `pkexec` executou o helper para reiniciar o `cron` e para a medição eBPF.
+- **eBPF**: só sob demanda (não é contínuo). Conta TCP/UDP enviados (`tcp_sendmsg`/`udp_sendmsg`), TCP
+  recebido (`tcp_cleanup_rbuf`) e UDP recebido (kretprobe em `udp_recvmsg`/`udpv6_recvmsg`); UDP enviado
+  por IPv6 (`udpv6_sendmsg`) não é contado, para evitar contagem dupla. Precisa do pacote `bpftrace` e de
+  root (via polkit). Testado em contêiner privilegiado no kernel 7.0.
 - **Várias máquinas**: testado com dois daemons locais (modo `url`) e com um contêiner com `sshd` (modo
   `ssh`, incluindo queda e reconexão do túnel); não com máquinas físicas diferentes. A remota é só leitura
   e o histórico longo/agentes vêm dela, mas preferências e alertas editáveis não.
-- **Docker**: só via CLI `docker` (precisa do usuário no grupo `docker`); sem Podman.
-- **Sessões do OpenClaw/"Ponto"**: leitura implementada via `sqlite3`, mas o programa não está instalado
-  na máquina de desenvolvimento; a consulta SQL foi validada contra os bancos reais (pelo módulo sqlite3
-  do Python) e o parser com saídas de exemplo.
-- **Hooks do Codex/OpenClaw**: sem instalação automática (o trecho do Codex é exibido para colar).
+- **Docker ou Podman**: só pelas CLIs `docker` ou `podman` (o Pulse usa o `docker` se ele responder,
+  senão o `podman`); o Docker precisa do usuário no grupo `docker`. O Podman foi testado com a versão
+  4.9.3 num contêiner (listar, parar e iniciar); CPU/memória pelo cgroup do Podman **não foi verificada**
+  (o contêiner de teste não tinha o controlador de memória), só com diretórios de exemplo nos testes.
+- **Sessões do OpenClaw/"Ponto"**: dependem do programa `sqlite3`. A leitura foi verificada nos bancos
+  reais (a consulta devolveu sessões com modelo e nº de mensagens); o painel mostra só as sessões dos
+  últimos 3 dias.
+- **Hooks do OpenClaw**: sem instalação automática (use o `pulse-hook` à mão, como em
+  [Agentes de IA](#agentes-de-ia)).
 - **Argumentos de ferramentas**: por privacidade, a tela Agentes mostra só **nomes** de ferramentas, não
   argumentos (o mock do Figma mostra comandos como `npm test`; isso foi uma decisão consciente). O modo
   detalhado é opt-in.
@@ -546,8 +580,8 @@ O que **não** foi feito ou **não** foi testado de ponta a ponta:
 
 ## Roadmap
 
-O plano por fases, com o status de validação de cada item e o que ainda está pendente (por exemplo, 1.7
-repositório APT/PPA e 4.5 interface em inglês), está em [ROADMAP.md](ROADMAP.md).
+O plano por fases, com o status de validação de cada item, o fechamento da v0.6.0 e o que ainda está
+pendente (por exemplo, 1.7 repositório APT/PPA), está em [ROADMAP.md](ROADMAP.md).
 
 ## Licença
 

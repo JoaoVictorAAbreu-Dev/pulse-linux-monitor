@@ -17,6 +17,14 @@ pub struct Health {
     pub nvme_used_pct: Option<f64>,
     pub media_errors: Option<f64>,
     pub error: Option<String>,
+    /// O smartctl foi negado por falta de permissão: a leitura com senha
+    /// (`POST /api/disk/smart/privileged`) resolve.
+    pub needs_root: bool,
+}
+
+/// Nome de disco aceito (`sda`, `nvme0n1`…): só letras e números ASCII.
+pub fn valid_device(d: &str) -> bool {
+    !d.is_empty() && d.len() <= 32 && d.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 fn attr(v: &Value, id: u32) -> Option<f64> {
@@ -70,40 +78,43 @@ pub fn parse_smartctl(device: &str, src: &str) -> Health {
             .unwrap_or_default();
         if !msgs.is_empty() {
             let joined = msgs.join(" · ");
-            h.error = Some(
-                if joined.contains("Permission denied")
-                    || joined.contains("Operation not permitted")
-                {
-                    "sem permissão: o smartctl precisa de root (ou do grupo disk) para ler este disco".into()
-                } else {
-                    joined
-                },
-            );
+            h.needs_root =
+                joined.contains("Permission denied") || joined.contains("Operation not permitted");
+            h.error = Some(if h.needs_root {
+                "sem permissão: o smartctl precisa de root (ou do grupo disk) para ler este disco"
+                    .into()
+            } else {
+                joined
+            });
         }
     }
     h
 }
 
 pub fn health_json(list: &[Health]) -> String {
-    json::arr(list.iter().map(|h| {
-        Obj::new()
-            .s("device", &h.device)
-            .s("model", &h.model)
-            .raw(
-                "passed",
-                &h.passed
-                    .map(|b| b.to_string())
-                    .unwrap_or_else(|| "null".into()),
-            )
-            .opt_n("temp_c", h.temp_c)
-            .opt_n("power_on_hours", h.power_on_hours)
-            .opt_n("reallocated", h.reallocated)
-            .opt_n("pending", h.pending)
-            .opt_n("nvme_used_pct", h.nvme_used_pct)
-            .opt_n("media_errors", h.media_errors)
-            .opt_s("error", h.error.as_deref())
-            .finish()
-    }))
+    json::arr(list.iter().map(health_obj))
+}
+
+/// Um disco em JSON (o mesmo objeto de cada item de `disks`).
+pub fn health_obj(h: &Health) -> String {
+    Obj::new()
+        .s("device", &h.device)
+        .s("model", &h.model)
+        .raw(
+            "passed",
+            &h.passed
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "null".into()),
+        )
+        .opt_n("temp_c", h.temp_c)
+        .opt_n("power_on_hours", h.power_on_hours)
+        .opt_n("reallocated", h.reallocated)
+        .opt_n("pending", h.pending)
+        .opt_n("nvme_used_pct", h.nvme_used_pct)
+        .opt_n("media_errors", h.media_errors)
+        .opt_s("error", h.error.as_deref())
+        .b("needs_root", h.needs_root)
+        .finish()
 }
 
 /// Consulta todos os discos inteiros. Lento (≈ 1 s por disco): só sob demanda.
@@ -124,7 +135,7 @@ pub fn smart_json(devices: &[String]) -> String {
     }
     let list: Vec<Health> = devices
         .iter()
-        .filter(|d| d.chars().all(|c| c.is_ascii_alphanumeric()))
+        .filter(|d| valid_device(d))
         .map(|d| {
             let dev = format!("/dev/{}", d);
             match sys::run_cmd("smartctl", &["-j", "-H", "-A", "-i", &dev], 15_000) {
@@ -139,6 +150,11 @@ pub fn smart_json(devices: &[String]) -> String {
         .collect();
     Obj::new()
         .b("available", true)
+        // o pulse-helper (pacote .deb) permite ler com senha os discos negados
+        .b(
+            "privileged",
+            std::path::Path::new(crate::services::HELPER).exists(),
+        )
         .raw("disks", &health_json(&list))
         .finish()
 }
@@ -173,7 +189,15 @@ mod tests {
             "sda",
             r#"{"smartctl":{"exit_status":2,"messages":[{"string":"Smartctl open device: /dev/sda failed: Permission denied","severity":"error"}]}}"#,
         );
+        assert!(p.needs_root);
+        assert!(health_obj(&p).contains("\"needs_root\":true"));
         assert!(p.error.unwrap().contains("root"));
+        assert!(!n.needs_root);
+        assert!(health_obj(&n).contains("\"needs_root\":false"));
+        assert!(valid_device("sda") && valid_device("nvme0n1"));
+        for bad in ["", "../sda", "sda1;x", "-a", "sd a", &"a".repeat(33)] {
+            assert!(!valid_device(bad), "{}", bad);
+        }
         assert!(parse_smartctl("sda", "lixo").error.is_some());
     }
 }
