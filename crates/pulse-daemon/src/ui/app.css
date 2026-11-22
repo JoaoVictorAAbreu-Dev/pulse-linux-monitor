@@ -323,3 +323,7 @@ code.cmd { font-family: var(--mono); font-size: 12px; background: var(--vidro-fo
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
+
+/* seletor de máquina (multi-máquina, somente leitura) */
+.host-sel { border: 0; font: inherit; font-size: 12px; cursor: pointer; appearance: auto; }
+.remote .host-sel { background: var(--aviso-suave); color: var(--aviso-texto); font-weight: 600; }

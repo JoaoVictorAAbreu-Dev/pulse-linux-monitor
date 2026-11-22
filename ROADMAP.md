@@ -90,6 +90,29 @@ incompatível).
 
 ## Fase 5 — Exploratório
 
+**Status (21/11/2026):** 5.1, 5.2 e 5.3 implementados; 5.4 decidido (não usar). Validado localmente
+com clippy `-D warnings`, testes unitários e de integração (incluindo um teste com dois daemons para o
+repasse), lintian sem avisos, interface conferida em Chromium headless e testes manuais em contêiner
+(túnel SSH com queda/reconexão; helper e bpftrace como root). Falta conferir o fluxo pkexec → helper com
+o pacote instalado.
+
+- **5.1 Helper polkit** — `pulse-helper` em `/usr/libexec/pulse-monitor/` com a política
+  `io.github.pulse-monitor.policy` (ações `manage-units` e `netprobe`, `auth_admin_keep`). O daemon chama
+  `pkexec pulse-helper unit <verbo> <unidade>`; erros do pkexec viram mensagens claras (cancelado, sem
+  autorização, sem agente).
+- **5.2 Multi-máquina** — `[remote.NOME]` com `ssh` (túnel `ssh -L` supervisionado) ou `url` (túnel
+  próprio). Repasse somente leitura `GET /api/remote/NOME/api/…` (inclui SSE) e seletor de máquina na UI.
+- **5.3 eBPF sob demanda** — `pulse-helper netprobe N` roda um script bpftrace fixo por N segundos e o
+  daemon resume bytes por processo e latência de disco (`POST /api/probe/net`, painel na tela Rede).
+  Optamos por medição pontual em vez de um coletor contínuo com capacidades: nada roda como root o tempo
+  todo e não há binário com `CAP_BPF` instalado.
+- **5.4 SQLite — decisão: não usar.** As consultas do histórico são faixas de tempo sobre médias
+  (1 min e 15 min) que cabem em memória (≈ 19 mil pontos); arquivos só-anexar com compactação já dão
+  recarga em milissegundos e não trazem dependência nativa. Reavaliar se surgirem consultas ad hoc
+  (ex.: filtros por processo ao longo de semanas).
+
+Ideias originais:
+
 - **Helper polkit próprio** para ações de sistema sem depender do agente da sessão (e finalmente testar esse fluxo numa VM).
 - **Multi-máquina**: um Pulse "central" agregando outros via túnel SSH (nunca expor sem TLS).
 - **eBPF opcional** (binário separado com capacidades) para tráfego de rede por processo e latência de disco.

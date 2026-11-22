@@ -13,6 +13,8 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: HashMap<String, String>,
+    /// Query string original (sem o `?`), para repasse.
+    pub raw_query: String,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
 }
@@ -102,6 +104,7 @@ pub fn parse_head(head: &str) -> Result<Request, ParseError> {
     Ok(Request {
         method,
         path: percent_decode(path),
+        raw_query: query.to_string(),
         query: parse_query(query),
         headers,
         body: Vec::new(),

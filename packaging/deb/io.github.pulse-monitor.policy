@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Pulse</vendor>
+  <vendor_url>https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor</vendor_url>
+  <icon_name>pulse-monitor</icon_name>
+
+  <action id="io.github.pulse-monitor.manage-units">
+    <description>Manage system services from Pulse</description>
+    <description xml:lang="pt_BR">Gerenciar serviços do sistema pelo Pulse</description>
+    <message>Authentication is required to start, stop or restart a system service from Pulse</message>
+    <message xml:lang="pt_BR">O Pulse precisa da sua senha para iniciar, parar ou reiniciar um serviço do sistema</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/pulse-monitor/pulse-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">unit</annotate>
+  </action>
+
+  <action id="io.github.pulse-monitor.netprobe">
+    <description>Measure network traffic per process and disk latency (eBPF)</description>
+    <description xml:lang="pt_BR">Medir tráfego de rede por processo e latência de disco (eBPF)</description>
+    <message>Authentication is required for Pulse to run a short eBPF measurement</message>
+    <message xml:lang="pt_BR">O Pulse precisa da sua senha para fazer uma medição eBPF de poucos segundos</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/libexec/pulse-monitor/pulse-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">netprobe</annotate>
+  </action>
+</policyconfig>

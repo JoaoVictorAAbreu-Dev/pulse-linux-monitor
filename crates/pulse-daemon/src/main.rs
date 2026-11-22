@@ -6,6 +6,7 @@ mod config;
 mod http;
 mod metrics;
 mod notify;
+mod remotes;
 mod settings;
 mod state;
 
@@ -128,6 +129,11 @@ fn main() {
     if let Ok(mut c) = shared.channels.write() {
         *c = channels;
     }
+    let remotes = remotes::build(&file.remotes);
+    remotes::spawn_supervisor(remotes.clone());
+    if let Ok(mut r) = shared.remotes.write() {
+        *r = remotes;
+    }
     // O token nunca vai para o log: só o caminho do arquivo.
     eprintln!(
         "pulse: ouvindo em http://{} (intervalo {} ms)",
@@ -195,6 +201,14 @@ fn serve(sh: Arc<Shared>, mut stream: TcpStream) {
             let _ = http::write_response(&mut stream, &r);
         }
         api::Outcome::Stream => sse(&sh, stream),
+        api::Outcome::Proxy(remote, path) => {
+            if let Err(e) = remotes::proxy(&remote, &path, &mut stream) {
+                let _ = http::write_response(
+                    &mut stream,
+                    &Response::error(502, &format!("máquina {}: {}", remote.cfg.name, e)),
+                );
+            }
+        }
     }
 }
 

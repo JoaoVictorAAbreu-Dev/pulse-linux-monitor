@@ -137,14 +137,24 @@ pub fn action(scope: Scope, verb: &str, unit: &str) -> Result<String, String> {
     if !valid_unit(unit) {
         return Err("nome de unidade inválido".into());
     }
+    // Escopo do sistema com o pacote instalado: helper próprio via pkexec,
+    // com política polkit e mensagem do Pulse (auth_admin_keep).
+    if scope == Scope::System && std::path::Path::new(HELPER).exists() {
+        let (ok, out, err) = sys::run_cmd("pkexec", &[HELPER, "unit", verb, unit], 180_000)?;
+        return if ok {
+            Ok(out.trim().to_string())
+        } else {
+            Err(pkexec_error(&err))
+        };
+    }
     let mut args: Vec<&str> = Vec::new();
     if let Some(f) = scope.flag() {
         args.push(f);
     }
-    // No escopo do sistema, o systemctl pede autorização ao polkit (agente
-    // gráfico da sessão). Não usamos sudo.
+    // Sem o helper, o systemctl pede autorização ao polkit (agente gráfico
+    // da sessão). Não usamos sudo.
     args.extend([verb, "--", unit]);
-    let (ok, out, err) = sys::run_cmd("systemctl", &args, 60_000)?;
+    let (ok, out, err) = sys::run_cmd("systemctl", &args, 180_000)?;
     if ok {
         Ok(out.trim().to_string())
     } else {
@@ -153,6 +163,30 @@ pub fn action(scope: Scope, verb: &str, unit: &str) -> Result<String, String> {
         } else {
             err.trim().to_string()
         })
+    }
+}
+
+/// Helper privilegiado instalado pelo pacote .deb.
+pub const HELPER: &str = "/usr/libexec/pulse-monitor/pulse-helper";
+
+/// Traduz as falhas do pkexec (cancelamento, sem autorização, sem agente).
+pub fn pkexec_error(err: &str) -> String {
+    let e = err.trim();
+    if e.contains("dismissed") || e.contains("cancel") {
+        "autenticação cancelada".into()
+    } else if e.contains("Not authorized") || e.contains("not authorized") {
+        "não autorizado pelo polkit".into()
+    } else if e.contains("No authentication agent") || e.contains("no authentication agent") {
+        "nenhum agente de autenticação na sessão (a janela de senha não pôde ser exibida)".into()
+    } else if e.is_empty() {
+        "a ação privilegiada falhou".into()
+    } else {
+        e.lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or(e)
+            .trim_start_matches("pulse-helper: ")
+            .to_string()
     }
 }
 
@@ -309,6 +343,26 @@ mod tests {
         );
         assert_eq!(u[1].name, "bad.service");
         assert_eq!(u[1].active, "failed");
+    }
+
+    #[test]
+    fn pkexec_errors() {
+        assert_eq!(
+            pkexec_error("Error executing command as another user: Request dismissed"),
+            "autenticação cancelada"
+        );
+        assert_eq!(
+            pkexec_error("Error executing command as another user: Not authorized"),
+            "não autorizado pelo polkit"
+        );
+        assert!(pkexec_error(
+            "Error executing command as another user: No authentication agent found."
+        )
+        .contains("agente"));
+        assert_eq!(
+            pkexec_error("pulse-helper: nome de unidade inválido\n"),
+            "nome de unidade inválido"
+        );
     }
 
     #[test]

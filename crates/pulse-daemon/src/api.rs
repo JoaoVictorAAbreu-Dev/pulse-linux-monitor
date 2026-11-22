@@ -61,6 +61,8 @@ pub fn authenticate(sh: &Shared, req: &Request) -> (Auth, bool) {
 pub enum Outcome {
     Resp(Response),
     Stream,
+    /// Repasse somente leitura para outra máquina: (máquina, caminho?query).
+    Proxy(std::sync::Arc<crate::remotes::Remote>, String),
 }
 
 fn body_json(req: &Request) -> Result<Value, Response> {
@@ -207,6 +209,34 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
 
     let r = match (m, p) {
         ("GET", "/api/stream") => return Outcome::Stream,
+        ("GET", "/api/remotes") => Response::ok_json(
+            sh.remotes
+                .read()
+                .map(|r| crate::remotes::list_json(&r))
+                .unwrap_or_else(|_| "[]".into()),
+        ),
+        (_, p) if p.starts_with("/api/remote/") => {
+            let rest = &p["/api/remote/".len()..];
+            let (name, sub) = rest.split_once('/').unwrap_or((rest, ""));
+            if m != "GET" {
+                return Outcome::Resp(Response::error(
+                    405,
+                    "máquinas remotas são somente leitura: abra o Pulse dela para executar ações",
+                ));
+            }
+            if !sub.starts_with("api/") || sub.starts_with("api/remote") {
+                return Outcome::Resp(Response::error(400, "só rotas /api/ da outra máquina"));
+            }
+            let Some(r) = sh.remotes.read().ok().and_then(|m| m.get(name).cloned()) else {
+                return Outcome::Resp(Response::error(404, "máquina não configurada"));
+            };
+            let target = if req.raw_query.is_empty() {
+                format!("/{}", sub)
+            } else {
+                format!("/{}?{}", sub, req.raw_query)
+            };
+            return Outcome::Proxy(r, target);
+        }
         ("GET", "/api/snapshot") => Response::ok_json(sh.lock().snapshot.as_bytes().to_vec()),
         ("GET", "/api/history") => Response::ok_json(sh.lock().ring.to_json()),
         ("GET", "/api/history/long") => {
@@ -402,6 +432,43 @@ pub fn handle(sh: &Arc<Shared>, req: &Request, peer: &str) -> Outcome {
             }
         }
         ("GET", "/api/disk/usage") => du_route(sh, req),
+        ("POST", "/api/probe/net") => {
+            let secs = body_json(req)
+                .ok()
+                .and_then(|v| v.get("seconds").and_then(|x| x.as_f64()))
+                .unwrap_or(10.0) as u32;
+            if !(1..=30).contains(&secs) {
+                return Outcome::Resp(Response::error(400, "seconds deve ser de 1 a 30"));
+            }
+            if !std::path::Path::new(services::HELPER).exists() {
+                return Outcome::Resp(Response::error(
+                    501,
+                    "a medição eBPF precisa do pulse-helper, instalado pelo pacote .deb",
+                ));
+            }
+            let s = secs.to_string();
+            let res = sys::run_cmd(
+                "pkexec",
+                &[services::HELPER, "netprobe", &s],
+                (secs as u64 + 180) * 1000,
+            );
+            let (status, body) = match res {
+                Ok((true, out, _)) => (
+                    "ok".to_string(),
+                    Response::ok_json(pulse_core::probe::to_json(
+                        &pulse_core::probe::parse_bpftrace(&out),
+                        secs,
+                    )),
+                ),
+                Ok((false, _, err)) => {
+                    let e = services::pkexec_error(&err);
+                    (e.clone(), Response::error(502, &e))
+                }
+                Err(e) => (e.clone(), Response::error(502, &e)),
+            };
+            auth::audit("probe.net", &format!("{} s", secs), &status, peer);
+            body
+        }
         ("GET", "/api/disk/smart") => {
             let devs: Vec<String> = disk::read_devices().into_iter().map(|d| d.0).collect();
             Response::ok_json(pulse_core::smart::smart_json(&devs))

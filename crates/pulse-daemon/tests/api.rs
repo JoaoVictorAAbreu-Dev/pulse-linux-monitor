@@ -780,3 +780,111 @@ fn phase4_metrics_pwa_and_notify_channels() {
     let audit = std::fs::read_to_string(env.state().join("audit.log")).unwrap();
     assert!(!audit.contains("tk_SEGREDO"), "auditoria sem segredos");
 }
+
+#[test]
+fn phase5_remote_machine_proxy() {
+    // A: a "outra máquina"; B: o Pulse central que a enxerga por URL
+    let env_a = Env::new("remA");
+    write_file(&env_a.config().join("config.toml"), "interval_ms = 300\n");
+    let a = start(&env_a, &[]);
+    let tok_a = env_a.token();
+    let env_b = Env::new("remB");
+    write_file(
+        &env_b.config().join("config.toml"),
+        &format!(
+            "[remote.maquina-a]\nurl = \"http://127.0.0.1:{}\"\nremote_port = {}\ntoken = \"{}\"\n",
+            a.port, a.port, tok_a
+        ),
+    );
+    let b = start(&env_b, &[]);
+    let tok_b = env_b.token();
+    let h = [("X-Pulse-Token", tok_b.as_str())];
+
+    let ok = wait_for(
+        || {
+            try_req(b.port, "GET", "/api/remotes", &h, "")
+                .map(|r| r.2.contains("\"state\":\"ok\""))
+                .unwrap_or(false)
+        },
+        25,
+    );
+    assert!(ok, "máquina A ficou ok");
+    // repasse de GET com query, usando o token de A (B nunca envia o próprio)
+    let (st, _, body) = req(&b, "GET", "/api/remote/maquina-a/api/config", &h, "");
+    assert_eq!(st, 200, "{}", body);
+    assert!(
+        body.contains("remA") && !body.contains("remB"),
+        "config de A, não de B: {}",
+        body
+    );
+    let (st, _, body) = req(
+        &b,
+        "GET",
+        "/api/remote/maquina-a/api/history/long?range=7d",
+        &h,
+        "",
+    );
+    assert_eq!(st, 200);
+    assert!(body.contains("\"bucket_ms\":60000"));
+    // SSE pelo repasse
+    let mut s = TcpStream::connect(("127.0.0.1", b.port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(
+        s,
+        "GET /api/remote/maquina-a/api/stream HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Pulse-Token: {}\r\n\r\n",
+        b.port, tok_b
+    )
+    .unwrap();
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    let mut got = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        line.clear();
+        if r.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        if line.starts_with("event: snapshot") {
+            got = true;
+            break;
+        }
+    }
+    assert!(got, "snapshot de A via SSE repassado");
+    // somente leitura, só /api/, máquina desconhecida, sem token local
+    assert_eq!(
+        req(
+            &b,
+            "POST",
+            "/api/remote/maquina-a/api/processes/1/pause",
+            &h,
+            ""
+        )
+        .0,
+        405
+    );
+    assert_eq!(
+        req(&b, "GET", "/api/remote/maquina-a/index.html", &h, "").0,
+        400
+    );
+    assert_eq!(
+        req(
+            &b,
+            "GET",
+            "/api/remote/maquina-a/api/remote/x/api/health",
+            &h,
+            ""
+        )
+        .0,
+        400
+    );
+    assert_eq!(
+        req(&b, "GET", "/api/remote/nao-existe/api/health", &h, "").0,
+        404
+    );
+    assert_eq!(
+        req(&b, "GET", "/api/remote/maquina-a/api/snapshot", &[], "").0,
+        401
+    );
+    let (_, _, list) = req(&b, "GET", "/api/remotes", &h, "");
+    assert!(!list.contains(&tok_a), "token remoto nunca aparece");
+}

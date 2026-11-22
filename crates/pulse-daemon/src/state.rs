@@ -54,6 +54,7 @@ pub struct Shared {
     pub config_warnings: Vec<String>,
     pub prefs: RwLock<AgentPrefs>,
     pub channels: RwLock<crate::notify::Channels>,
+    pub remotes: RwLock<crate::remotes::Remotes>,
     /// Último aviso de "pedindo atenção" por sessão (antispam).
     pub attention_sent: Mutex<std::collections::HashMap<String, Instant>>,
 }
@@ -157,6 +158,7 @@ impl Shared {
             config_warnings,
             prefs: RwLock::new(prefs),
             channels: RwLock::new(crate::notify::Channels::default()),
+            remotes: RwLock::new(crate::remotes::build(&Default::default())),
             attention_sent: Mutex::new(std::collections::HashMap::new()),
         })
     }

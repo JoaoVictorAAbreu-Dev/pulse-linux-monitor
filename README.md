@@ -25,7 +25,7 @@ Baixe o `.deb` da página de Releases do GitHub (amd64 e arm64) ou gere localmen
 ```sh
 packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
 packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
-sudo apt install ./target/deb/pulse-monitor_0.4.0_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.5.0_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 ```
 
@@ -60,6 +60,19 @@ Se você também usou o `install.sh`, a unidade em `~/.config/systemd/user/` tem
   abre o painel. `pulse-tray --install-autostart` inicia junto com a sessão. Usa o protocolo
   StatusNotifierItem direto pelo D-Bus (python3-gi/Gio), sem GTK; no GNOME depende da extensão de
   AppIndicators (padrão no Ubuntu).
+- **Várias máquinas (somente leitura)**: cada `[remote.NOME]` no `config.toml` aparece num seletor no
+  topo da interface. Com `ssh = "usuario@host"` o Pulse mantém um túnel `ssh -L` supervisionado (reconecta
+  sozinho, com espera crescente) até o Pulse da outra máquina, que continua só no loopback dela; com
+  `url = "http://127.0.0.1:PORTA"` ele usa um túnel que você já mantém. Precisa do token da outra máquina
+  (`token = "…"`), que fica só no seu `config.toml` e nunca é devolvido pela API. Ações (sinais, serviços,
+  contêineres) são recusadas na máquina remota: abra o Pulse dela para isso.
+
+  ```toml
+  [remote.servidor]
+  ssh = "ana@192.168.1.20"          # chave sem senha ou ssh-agent; BatchMode, sem prompt
+  ssh_key = "/home/ana/.ssh/id_ed25519"
+  token = "<conteúdo de ~/.config/pulse/token no servidor>"
+  ```
 
 ## Uso
 
@@ -129,12 +142,15 @@ Linhas inválidas viram avisos (no log do serviço e em `GET /api/config`) e nã
    prioridade (renice), sempre com confirmação.
 6. **Serviços** — systemd de usuário e de sistema, filtros, busca, iniciar/parar/reiniciar; timers do systemd
    (próxima/última execução), **CPU e memória por unidade** a partir do cgroup v2 (sem root),
-   botão **Logs** que abre a tela Logs filtrada pela unidade, cron (crontab do usuário, `/etc/crontab`, `/etc/cron.d` e `cron.{daily,...}`,
+   botão **Logs** que abre a tela Logs filtrada pela unidade; no escopo do sistema as ações passam pelo
+   `pulse-helper` via `pkexec` (janela de senha do polkit, autorização mantida por alguns minutos), cron (crontab do usuário, `/etc/crontab`, `/etc/cron.d` e `cron.{daily,...}`,
    com variáveis ocultas e senhas/tokens mascarados) e contêineres Docker (estado, portas, CPU/memória sob
    demanda — ou pelo cgroup, sem `docker stats` —, **logs do contêiner** e iniciar/parar/reiniciar com
    confirmação e auditoria).
 7. **Rede** — ↓/↑, conexões TCP por estado, interfaces e portas em escuta com processo dono e marca
-   "só local" / "acessível na rede".
+   "só local" / "acessível na rede"; **tráfego por processo (eBPF)** sob demanda: 5, 10 ou 30 s de
+   medição com `bpftrace` (bytes TCP/UDP enviados e recebidos por processo e latência média/máxima dos
+   discos), com senha via polkit.
 8. **Logs** — journalctl (sistema/usuário), unidade, prioridade, nº de linhas, busca e "seguir".
 9. **Agentes** — processos de agentes (Claude Code, Codex, OpenClaw/"Ponto" e regras de
    `agents.conf`), servidores MCP filhos, sessões (Claude Code, Codex e OpenClaw) com **ritmo** (tempo ativo
@@ -169,6 +185,9 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 | `GET /metrics` | exposição para o Prometheus (aceita `Authorization: Bearer`) |
 | `GET /api/config/notify` · `POST /api/config/notify` · `POST /api/notify/test` | canais externos (sem devolver segredos) |
 | `GET /api/config` · `POST /api/config/alerts` | configuração efetiva e edição dos limiares |
+| `POST /api/probe/net` `{"seconds":1..30}` | medição eBPF sob demanda (pede senha via polkit; 501 sem o helper) |
+| `GET /api/remotes` | máquinas configuradas e estado (`conectando`, `ok`, `erro`), sem tokens |
+| `GET /api/remote/{nome}/api/…` | repasse somente leitura para o Pulse de outra máquina (inclui SSE); outros métodos → 405 |
 
 ## Segurança
 
@@ -185,6 +204,13 @@ Todas as rotas exigem autenticação, exceto a UI estática, `GET /api/health` (
 - Ações sensíveis (sinais em processos, ações em serviços e contêineres, instalação de hooks) vão para
   `~/.local/state/pulse/audit.log` (0600). PID 1 e o próprio Pulse são protegidos; antes do SIGKILL o
   Pulse confere se o PID não foi reutilizado.
+- **Privilégios**: o daemon roda como seu usuário. O que exige root passa pelo `pulse-helper`
+  (`/usr/libexec/pulse-monitor/`), executado via `pkexec` com a política
+  `io.github.pulse-monitor.policy` (`auth_admin_keep`, só sessão ativa). O helper aceita apenas
+  `unit start|stop|restart <nome>.service` e `netprobe <1..30>` (script bpftrace fixo), limpa o ambiente e
+  chama `/usr/bin/systemctl` e `/usr/bin/bpftrace` por caminho absoluto.
+- **Máquinas remotas**: o túnel liga `127.0.0.1` local a `127.0.0.1` remoto (nada exposto na rede), o
+  repasse só aceita `GET` em `/api/…` e usa o token da outra máquina, nunca o seu.
 - A URL de `--print-token` leva o token no fragmento (`#token=…`), que não é enviado ao servidor;
   a UI o troca por um cookie e limpa a barra de endereço.
 
@@ -250,9 +276,11 @@ ao reiniciar o serviço.
 - CI (GitHub Actions): `cargo fmt --check`, `clippy -D warnings`, testes, sintaxe da UI e dos scripts;
   depois gera os `.deb` amd64 e arm64, roda `lintian --fail-on warning` e instala/remove o pacote amd64.
   Em tags `v*`, publica uma Release com os `.deb` e `SHA256SUMS`.
-- `cargo test`: 72 testes unitários + 9 de integração (`crates/pulse-daemon/tests/api.rs`), que sobem o
+- `cargo test`: 108 testes unitários + 13 de integração (`crates/pulse-daemon/tests/api.rs`), que sobem o
   binário real com HOME/XDG temporários e cobrem autenticação, Host/Origin, SSE, persistência entre
-  reinícios, arquivo de configuração, rotação do token, bloqueio por força bruta e a CLI.
+  reinícios, arquivo de configuração, rotação do token, bloqueio por força bruta, a CLI e o repasse para
+  outra máquina (dois daemons: GET com query, SSE, POST → 405, máquina desconhecida → 404, token remoto
+  nunca exposto).
 - Antes da Fase 1: 62 testes (coletores com amostras sintéticas, JSON, histórico longo — agregação em ms,
   recarga, linhas inválidas, compactação, falhas de E/S —, alertas, auth, HTTP, hooks, transcrições, cron/Docker).
 - Daemon real: rotas, autenticação (401/421/403), SSE, `--once`, reinício com recarga do histórico longo.
@@ -270,18 +298,26 @@ cargo run -p pulse-daemon -- --port 7979 --interval-ms 500
 
 Seja honesto com o que existe:
 
-- **SQLite**: o histórico longo é um arquivo texto; não há banco de dados.
+- **SQLite**: decisão de **não usar** (veja a Fase 5 do ROADMAP): as consultas do histórico continuam
+  simples e os arquivos texto bastam.
 - **Tauri**: não há app nativo; a interface web pode ser instalada como PWA e há o `pulse-tray` (Python + D-Bus).
 - **Interface em inglês (roadmap 4.5)**: ainda não; a UI é só em pt-BR.
 - **Telegram e Discord**: implementados, mas só testados com um receptor HTTP local (formato das
   requisições), não contra os serviços reais. O ntfy e o webhook JSON foram testados de ponta a ponta com
   um receptor local.
-- **Helper polkit próprio**: ações em serviços de sistema chamam `systemctl` e dependem do agente polkit
-  da sessão. **Esse fluxo não foi testado.**
+- **Helper polkit**: o helper foi testado direto como root (num contêiner) e o `pkexec` disparado pelo
+  serviço de usuário abriu a janela de senha do GNOME, mas o caminho completo **pacote instalado →
+  política → helper** só fica conferido depois de instalar a 0.5.0. Sem o pacote (rodando via `cargo`), as
+  ações de sistema caem no `systemctl` direto, que pede autorização ao polkit por conta própria.
 - **SMART**: implementado via `smartctl`, mas **não testado em hardware real** (o smartmontools não
   está instalado na máquina de desenvolvimento; só o parser foi testado com saídas de exemplo). Ler SMART
   normalmente exige root ou o grupo `disk`.
-- **eBPF**: não implementado.
+- **eBPF**: só sob demanda (não é contínuo) e só TCP/UDP enviados (`tcp_sendmsg`/`udp_sendmsg`) e TCP
+  recebidos (`tcp_cleanup_rbuf`); UDP recebido fica de fora. Precisa do pacote `bpftrace` e de root (via
+  polkit). Testado em contêiner privilegiado no kernel 7.0.
+- **Várias máquinas**: testado com dois daemons locais (modo `url`) e com um contêiner com `sshd` (modo
+  `ssh`, incluindo queda e reconexão do túnel); não com máquinas físicas diferentes. A remota é só leitura
+  e o histórico longo/agentes vêm dela, mas preferências e alertas editáveis não.
 - **RAPL**: o consumo da CPU só aparece se `/sys/class/powercap/intel-rapl:0/energy_uj` for legível;
   em kernels recentes ele é restrito ao root. Bateria só testada com dados de exemplo (máquina desktop).
 - **Docker**: só via CLI `docker` (precisa do usuário no grupo `docker`); sem logs de contêiner nem Podman.

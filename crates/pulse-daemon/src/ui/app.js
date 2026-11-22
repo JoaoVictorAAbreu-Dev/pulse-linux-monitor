@@ -75,6 +75,8 @@
     page: null,
     agents: null,
     es: null,
+    remote: session.get('pulse.remote') || '',
+    remotes: [],
   };
   const HIST_MAX = 900;
 
@@ -94,9 +96,15 @@
 
   // ------------------------------------------------------------ API
   const token = () => session.get('pulse.token');
+  // Máquina remota selecionada: GETs de /api/ passam pelo repasse somente leitura.
+  const remotePath = (path) => (S.remote && path.startsWith('/api/') && path !== '/api/remotes' ? `/api/remote/${encodeURIComponent(S.remote)}${path}` : path);
   async function api(path, opts = {}) {
     const headers = {};
     const method = opts.method || 'GET';
+    if (S.remote && method !== 'GET' && !opts.local) {
+      throw new Error(`${S.remote} é somente leitura aqui: abra o Pulse dessa máquina para executar ações`);
+    }
+    if (!opts.local) path = remotePath(path);
     if (method !== 'GET') {
       if (!token()) await askToken('Para executar ações, informe o token de acesso.');
       headers['X-Pulse-Token'] = token() || '';
@@ -843,7 +851,7 @@
         + panel('Timers do systemd', '<div id="sv-timers"><p class="empty">Carregando…</p></div>', '<span class="sp"></span><span class="muted" id="sv-timers-scope" style="text-transform:none;letter-spacing:0;font-weight:500"></span>')
         + panel('Cron', '<div id="sv-cron"><p class="empty">Carregando…</p></div>')
         + panel('Contêineres (Docker)', '<div id="sv-ct"><p class="empty">Carregando…</p></div>', '<span class="sp"></span><button class="btn sm" id="sv-ct-stats">Medir CPU/memória</button><button class="btn sm" id="sv-ct-reload">Atualizar</button>');
-      const note = () => { $('#sv-timers-scope').textContent = SV.scope === 'user' ? 'escopo: usuário' : 'escopo: sistema'; loadTimers();  $('#sv-note').innerHTML = SV.scope === 'system' ? 'Ações no escopo do <b>sistema</b> pedem autorização ao polkit (sem sudo). <b>Este fluxo não foi testado</b>; se não houver agente polkit na sessão, a ação falha.' : 'Serviços do seu usuário (<code class="cmd">systemctl --user</code>).'; };
+      const note = () => { $('#sv-timers-scope').textContent = SV.scope === 'user' ? 'escopo: usuário' : 'escopo: sistema'; loadTimers();  $('#sv-note').innerHTML = SV.scope === 'system' ? 'Ações no escopo do <b>sistema</b> abrem a janela de senha do polkit (helper do Pulse via <code class="cmd">pkexec</code>, sem sudo); a autorização vale por alguns minutos. Sem agente polkit na sessão, a ação falha com aviso.' : 'Serviços do seu usuário (<code class="cmd">systemctl --user</code>).'; };
       note();
       $('#sv-scope').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; SV.scope = b.dataset.s; $$('#sv-scope button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); note(); html('sv-table', '<p class="empty">Carregando…</p>'); loadServices(); });
       $('#sv-filter').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return; SV.filter = b.dataset.f; $$('#sv-filter button').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); renderServices(); });
@@ -883,13 +891,41 @@
   });
 
   // ---- 7. Rede
+  const NP = { last: null, busy: false };
+  function renderProbe(r) {
+    const disk = r.disk_ops ? `${num(r.disk_ops)} operações de disco · latência média ${num(r.disk_avg_us / 1000, 2)} ms · máxima ${num(r.disk_max_us / 1000, 1)} ms` : 'nenhuma operação de disco no intervalo';
+    html('n-probe', `<p class="muted">Últimos ${r.seconds} s · ${esc(disk)}</p>` + (r.procs.length ? `<div class="table-wrap"><table class="t-compact"><thead><tr><th>Processo</th><th class="num">PID</th><th class="num">↓ média</th><th class="num">↑ média</th><th class="num">Recebido</th><th class="num">Enviado</th></tr></thead><tbody>
+      ${r.procs.map((p) => `<tr><td><b>${esc(p.comm)}</b></td><td class="num">${p.pid}</td><td class="num">${rate(p.rx_bps)}</td><td class="num">${rate(p.tx_bps)}</td><td class="num">${bytes(p.rx)}</td><td class="num">${bytes(p.tx)}</td></tr>`).join('')}</tbody></table></div>` : '<p class="empty">Nenhum tráfego TCP/UDP no intervalo.</p>'));
+  }
+  async function probeNet() {
+    if (NP.busy) return;
+    const b = $('#n-probe-go');
+    const secs = Number($('#n-probe-s').value) || 10;
+    NP.busy = true;
+    b.disabled = true;
+    b.textContent = 'Medindo…';
+    html('n-probe', `<p class="empty">Aguardando a senha e medindo por ${secs} s…</p>`);
+    try {
+      NP.last = await api('/api/probe/net', { method: 'POST', body: { seconds: secs } });
+      if ($('#n-probe')) renderProbe(NP.last);
+    } catch (e) {
+      if ($('#n-probe')) html('n-probe', `<p class="empty">Erro: ${esc(e.message)}</p>`);
+    } finally {
+      NP.busy = false;
+      const bb = $('#n-probe-go');
+      if (bb) { bb.disabled = false; bb.textContent = 'Medir'; }
+    }
+  }
   page('rede', 'Rede', 'globe', {
     mount(el) {
       el.innerHTML = `
         <div class="grid g3">${kpi('n-rx')}${kpi('n-tx')}${kpi('n-tcp')}</div>
         ${card('Tráfego', '<div id="n-chart"></div><div class="series-legend"><span><i class="dot" style="background:var(--acento)"></i>Download</span><span><i class="dot" style="background:var(--violeta)"></i>Upload</span></div>')}
         ${card('Interfaces', '<div id="n-if"></div>')}
+        ${card('Tráfego por processo (eBPF)', '<p class="sub">Medição sob demanda com bpftrace: bytes enviados/recebidos por processo e latência dos discos no intervalo. Pede sua senha (polkit) e precisa do pacote <code class="cmd">bpftrace</code>.</p><div id="n-probe"></div>', '<span class="sp"></span><select id="n-probe-s" class="input" style="width:auto"><option value="5">5 s</option><option value="10" selected>10 s</option><option value="30">30 s</option></select><button class="btn sm primary" id="n-probe-go">Medir</button>')}
         ${card('Portas em escuta', '<div id="n-listen"></div>', '<span class="sp"></span><span class="muted" style="text-transform:none;letter-spacing:0;font-weight:500">processos de outros usuários aparecem sem dono</span>')}`;
+      $('#n-probe-go').addEventListener('click', probeNet);
+      if (NP.last) renderProbe(NP.last);
     },
     update(s) {
       const n = s.net;
@@ -1342,6 +1378,40 @@
     if (b) { b.hidden = !n; b.textContent = n; b.className = 'badge' + (crit ? ' crit' : ''); }
     document.title = n ? `(${n}) Pulse` : 'Pulse';
   }
+  // Seletor de máquina (só aparece com [remote.*] configurado).
+  async function loadRemotes() {
+    try { S.remotes = await api('/api/remotes', { local: true }); } catch { S.remotes = []; }
+    if (S.remote && !S.remotes.some((r) => r.name === S.remote)) { S.remote = ''; session.del('pulse.remote'); }
+    const sel = $('#host-sel');
+    sel.hidden = !S.remotes.length;
+    if (!S.remotes.length) return;
+    const st = { ok: '', conectando: ' (conectando)', erro: ' (erro)' };
+    sel.innerHTML = '<option value="">Esta máquina</option>' + S.remotes.map((r) => `<option value="${esc(r.name)}"${r.name === S.remote ? ' selected' : ''}${r.state === 'ok' || r.name === S.remote ? '' : ' disabled'}>${esc(r.name)}${r.hostname && r.hostname !== r.name ? ' · ' + esc(r.hostname) : ''}${st[r.state] ?? ''}</option>`).join('');
+  }
+  async function switchMachine(name) {
+    S.remote = name;
+    if (name) session.set('pulse.remote', name); else session.del('pulse.remote');
+    document.documentElement.classList.toggle('remote', !!name);
+    S.snap = null;
+    S.lastSeq = 0;
+    S.agents = null;
+    for (const k in S.hist) S.hist[k] = [];
+    if (S.es) S.es.close();
+    await loadInitial();
+    route();
+    startStream();
+    toast(name ? `Vendo ${name} (somente leitura)` : 'Vendo esta máquina');
+  }
+  async function loadInitial() {
+    try {
+      const hist = await api('/api/history');
+      for (const k in S.hist) S.hist[k] = (hist[k] || []).map((v) => (v == null ? null : v));
+      // a GPU não está no anel do servidor: começa vazia, alinhada ao tempo
+      S.hist.gpu = S.hist.ts.map(() => null);
+    } catch { /* começa vazio */ }
+    try { const snap = await api('/api/snapshot'); if (snap && snap.cpu) { S.snap = snap; S.lastSeq = snap.seq; renderHeader(snap); } } catch { /* idem */ }
+  }
+  $('#host-sel').addEventListener('change', (e) => switchMachine(e.target.value));
   function route() {
     const id = (location.hash.match(/^#\/([\w-]+)/) || [])[1] || 'visao-geral';
     const p = PAGES.find((x) => x.id === id) || PAGES[0];
@@ -1409,6 +1479,7 @@
     if (raf) return;
     raf = requestAnimationFrame(() => {
       raf = 0;
+      if (!S.snap) return; // trocou de máquina neste quadro
       renderHeader(S.snap);
       if (S.page && S.page.update) S.page.update(S.snap);
     });
@@ -1416,7 +1487,7 @@
 
   function startStream() {
     if (S.es) S.es.close();
-    const es = new EventSource('/api/stream');
+    const es = new EventSource(remotePath('/api/stream'));
     S.es = es;
     es.addEventListener('snapshot', (e) => { try { onSnapshot(JSON.parse(e.data)); } catch { /* ignora */ } });
     es.addEventListener('hook', () => { if (S.page && (S.page.id === 'agentes' || S.page.id === 'visao-geral')) pollAgents(); });
@@ -1459,15 +1530,12 @@
       h = await (await fetch('/api/health', { credentials: 'same-origin' })).json();
       if (!h.authenticated) { route(); await showLogin(); return; }
     }
-    try {
-      const hist = await api('/api/history');
-      for (const k in S.hist) S.hist[k] = (hist[k] || []).map((v) => (v == null ? null : v));
-      // a GPU não está no anel do servidor: começa vazia, alinhada ao tempo
-      S.hist.gpu = S.hist.ts.map(() => null);
-    } catch { /* começa vazio */ }
-    try { const snap = await api('/api/snapshot'); if (snap && snap.cpu) { S.snap = snap; S.lastSeq = snap.seq; renderHeader(snap); } } catch { /* idem */ }
+    await loadRemotes();
+    document.documentElement.classList.toggle('remote', !!S.remote);
+    await loadInitial();
     route();
     startStream();
+    setInterval(loadRemotes, 30000);
   }
   boot();
 })();

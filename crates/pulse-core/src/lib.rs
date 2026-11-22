@@ -15,6 +15,7 @@ pub mod longterm;
 pub mod mem;
 pub mod net;
 pub mod power;
+pub mod probe;
 pub mod procs;
 pub mod schedule;
 pub mod sensors;

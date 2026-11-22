@@ -31,7 +31,9 @@ esac
 if [ "$BUILD" = 1 ]; then
   if [ -n "$TARGET" ]; then cargo build --release --target "$TARGET"; else cargo build --release; fi
 fi
+HELPER_BIN="$(dirname "$BIN")/pulse-helper"
 [ -x "$BIN" ] || { echo "faltando $BIN" >&2; exit 1; }
+[ -x "$HELPER_BIN" ] || { echo "faltando $HELPER_BIN" >&2; exit 1; }
 
 # Versão mínima da glibc exigida (readelf lê ELF de qualquer arquitetura).
 GLIBC=$(readelf --dyn-syms -W "$BIN" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
@@ -42,9 +44,12 @@ rm -rf "${ROOT:?}"
 install -d "$ROOT/DEBIAN" "$ROOT/usr/bin" "$ROOT/usr/lib/systemd/user" \
   "$ROOT/usr/share/doc/$PKG" "$ROOT/usr/share/$PKG" "$ROOT/usr/share/applications" \
   "$ROOT/usr/share/icons/hicolor/scalable/apps" "$ROOT/usr/share/man/man1" \
-  "$ROOT/usr/share/bash-completion/completions"
+  "$ROOT/usr/share/bash-completion/completions" \
+  "$ROOT/usr/libexec/$PKG" "$ROOT/usr/share/polkit-1/actions"
 
 install -m 755 "$BIN" "$ROOT/usr/bin/pulse"
+install -m 755 "$HELPER_BIN" "$ROOT/usr/libexec/$PKG/pulse-helper"
+install -m 644 packaging/deb/io.github.pulse-monitor.policy "$ROOT/usr/share/polkit-1/actions/io.github.pulse-monitor.policy"
 install -m 755 packaging/pulse-hook "$ROOT/usr/bin/pulse-hook"
 install -m 755 packaging/deb/pulse-open "$ROOT/usr/bin/pulse-open"
 install -m 755 packaging/pulse-tray "$ROOT/usr/bin/pulse-tray"
@@ -75,7 +80,7 @@ Maintainer: JoaoVictorAAbreu-Dev <noreply@github.com>
 Installed-Size: $SIZE
 Depends: libc6 (>= $GLIBC), systemd, python3
 Recommends: curl, libnotify-bin, python3-gi
-Suggests: docker.io, xdg-utils
+Suggests: docker.io, xdg-utils, bpftrace, smartmontools, openssh-client
 Section: admin
 Priority: optional
 Homepage: https://github.com/JoaoVictorAAbreu-Dev/pulse-linux-monitor
@@ -85,6 +90,9 @@ Description: monitor do Ubuntu com painel de agentes de IA
  http://127.0.0.1:7878: CPU, memória, discos, processos, serviços, timers,
  cron, contêineres, rede, logs, alertas e os agentes de IA (Claude Code,
  Codex, OpenClaw) com sessões e eventos ao vivo via hooks.
+ .
+ Ações privilegiadas (serviços do sistema, medição eBPF) passam por um
+ helper próprio via pkexec, com política polkit do Pulse.
  .
  Escuta só no loopback e exige token. O serviço é de usuário:
  systemctl --user enable --now pulse

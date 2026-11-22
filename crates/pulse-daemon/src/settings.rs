@@ -31,6 +31,8 @@ pub struct FileConfig {
     pub channels: crate::notify::Channels,
     pub notify_alerts: Option<bool>,
     pub notify_agents: Option<bool>,
+    /// [remote.NOME]: outras máquinas com Pulse.
+    pub remotes: BTreeMap<String, crate::remotes::RemoteCfg>,
 }
 
 pub fn valid_telegram_token(t: &str) -> bool {
@@ -217,6 +219,33 @@ pub fn parse(src: &str) -> (FileConfig, Vec<String>) {
                 }
                 _ => bad(&mut warn),
             },
+            (sec, key) if sec.starts_with("remote.") => {
+                let name = &sec["remote.".len()..];
+                if !crate::remotes::valid_name(name) {
+                    warn.push(format!("linha {}: nome de máquina inválido [{}] (use a-z, 0-9 e -)", n + 1, sec));
+                    continue;
+                }
+                let r = c.remotes.entry(name.to_string()).or_insert_with(|| crate::remotes::RemoteCfg {
+                    name: name.to_string(),
+                    remote_port: 7878,
+                    ..Default::default()
+                });
+                match key {
+                    "ssh" if crate::remotes::valid_ssh_target(v) => r.ssh = Some(v.to_string()),
+                    "ssh_port" => match v.parse::<u16>() {
+                        Ok(p) if p > 0 => r.ssh_port = Some(p),
+                        _ => bad(&mut warn),
+                    },
+                    "ssh_key" if v.starts_with('/') && !v.contains('\n') => r.ssh_key = Some(v.to_string()),
+                    "url" if crate::remotes::parse_http_url(v).is_some() => r.url = Some(v.to_string()),
+                    "remote_port" => match v.parse::<u16>() {
+                        Ok(p) if p > 0 => r.remote_port = p,
+                        _ => bad(&mut warn),
+                    },
+                    "token" if v.len() >= 32 && v.chars().all(|ch| ch.is_ascii_hexdigit()) => r.token = v.to_string(),
+                    _ => bad(&mut warn),
+                }
+            }
             ("alerts", key) if ALERT_KEYS.contains(&key) => match v.parse::<f64>() {
                 Ok(x) if x.is_finite() => {
                     c.alerts.insert(key.to_string(), x);
@@ -234,6 +263,20 @@ pub fn parse(src: &str) -> (FileConfig, Vec<String>) {
                 key
             )),
         }
+    }
+    // máquina remota precisa de token e de exatamente um meio de acesso
+    let bad_remotes: Vec<String> = c
+        .remotes
+        .values()
+        .filter(|r| r.token.is_empty() || r.ssh.is_some() == r.url.is_some())
+        .map(|r| r.name.clone())
+        .collect();
+    for name in bad_remotes {
+        warn.push(format!(
+            "[remote.{}] ignorada: precisa de token e de ssh OU url",
+            name
+        ));
+        c.remotes.remove(&name);
     }
     (c, warn)
 }
@@ -496,6 +539,15 @@ pub const EXAMPLE: &str = "# ~/.config/pulse/config.toml — configuração do P
 # Um modelo casa pelo nome exato ou pelo prefixo mais longo.
 # \"claude-opus-5-5\" = \"0, 0, 0, 0\"
 
+# Outras máquinas com Pulse (somente leitura). Uma seção por máquina:
+# [remote.servidor]
+# ssh = \"ana@192.168.1.20\"      # túnel ssh -L supervisionado pelo Pulse (chave sem senha ou ssh-agent)
+# ssh_port = 22
+# ssh_key = \"/home/ana/.ssh/id_ed25519\"
+# remote_port = 7878
+# token = \"<conteúdo de ~/.config/pulse/token na outra máquina>\"
+# (ou, em vez de ssh: url = \"http://127.0.0.1:17878\" para um túnel que você já mantém)
+
 [notify]
 # Canais externos para alertas (e, opcionalmente, agentes pedindo atenção).
 # ntfy_url = \"https://ntfy.sh/um-topico-dificil-de-adivinhar\"
@@ -586,6 +638,28 @@ mod tests {
         assert_eq!(c.prices["ollama/qwen3:4b"], [0.0; 4]);
         assert_eq!(w.len(), 2, "{:?}", w);
         assert_eq!(parse_price("-1,0,0,0"), None);
+    }
+
+    #[test]
+    fn remote_sections() {
+        let tok = "a".repeat(64);
+        let src = format!(
+            "[remote.srv]\nssh = \"ana@10.0.0.2\"\nssh_port = 2222\ntoken = \"{t}\"\n[remote.lan]\nurl = \"http://127.0.0.1:17878\"\ntoken = \"{t}\"\n[remote.ruim]\nssh = \"x@y\"\nurl = \"http://a:1\"\ntoken = \"{t}\"\n[remote.Maiusc]\nssh = \"a@b\"\n[remote.semtoken]\nssh = \"a@b\"\n[remote.inj]\nssh = \"-oProxyCommand=x\"\n",
+            t = tok
+        );
+        let (c, w) = parse(&src);
+        assert_eq!(
+            c.remotes.len(),
+            2,
+            "{:?}",
+            c.remotes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(c.remotes["srv"].ssh_port, Some(2222));
+        assert_eq!(c.remotes["lan"].remote_port, 7878);
+        assert!(w.iter().any(|x| x.contains("[remote.ruim] ignorada")));
+        assert!(w.iter().any(|x| x.contains("Maiusc")));
+        assert!(w.iter().any(|x| x.contains("semtoken")));
+        assert!(w.iter().any(|x| x.contains("valor inválido para ssh")));
     }
 
     #[test]
