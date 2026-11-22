@@ -141,11 +141,14 @@ pub fn action(scope: Scope, verb: &str, unit: &str) -> Result<String, String> {
     // com política polkit e mensagem do Pulse (auth_admin_keep).
     if scope == Scope::System && std::path::Path::new(HELPER).exists() {
         let (ok, out, err) = sys::run_cmd("pkexec", &[HELPER, "unit", verb, unit], 180_000)?;
-        return if ok {
-            Ok(out.trim().to_string())
-        } else {
-            Err(pkexec_error(&err))
-        };
+        if ok {
+            return Ok(out.trim().to_string());
+        }
+        // pkexec bloqueado (ex.: unidade com NoNewPrivileges=yes): cai no
+        // systemctl, que pede autorização ao polkit pelo D-Bus.
+        if !err.contains("must be setuid root") {
+            return Err(pkexec_error(&err));
+        }
     }
     let mut args: Vec<&str> = Vec::new();
     if let Some(f) = scope.flag() {
@@ -172,7 +175,10 @@ pub const HELPER: &str = "/usr/libexec/pulse-monitor/pulse-helper";
 /// Traduz as falhas do pkexec (cancelamento, sem autorização, sem agente).
 pub fn pkexec_error(err: &str) -> String {
     let e = err.trim();
-    if e.contains("dismissed") || e.contains("cancel") {
+    if e.contains("must be setuid root") {
+        "o pkexec não pode ganhar privilégio neste processo (serviço com NoNewPrivileges=yes?)"
+            .into()
+    } else if e.contains("dismissed") || e.contains("cancel") {
         "autenticação cancelada".into()
     } else if e.contains("Not authorized") || e.contains("not authorized") {
         "não autorizado pelo polkit".into()
@@ -359,6 +365,7 @@ mod tests {
             "Error executing command as another user: No authentication agent found."
         )
         .contains("agente"));
+        assert!(pkexec_error("pkexec must be setuid root").contains("NoNewPrivileges"));
         assert_eq!(
             pkexec_error("pulse-helper: nome de unidade inválido\n"),
             "nome de unidade inválido"

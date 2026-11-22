@@ -25,7 +25,7 @@ Baixe o `.deb` da página de Releases do GitHub (amd64 e arm64) ou gere localmen
 ```sh
 packaging/build-deb.sh                       # gera target/deb/pulse-monitor_<versão>_amd64.deb
 packaging/build-deb.sh --target aarch64-unknown-linux-gnu   # arm64 (precisa de gcc-aarch64-linux-gnu)
-sudo apt install ./target/deb/pulse-monitor_0.5.0_amd64.deb
+sudo apt install ./target/deb/pulse-monitor_0.5.1_amd64.deb
 systemctl --user daemon-reload && systemctl --user enable --now pulse
 ```
 
@@ -305,10 +305,11 @@ Seja honesto com o que existe:
 - **Telegram e Discord**: implementados, mas só testados com um receptor HTTP local (formato das
   requisições), não contra os serviços reais. O ntfy e o webhook JSON foram testados de ponta a ponta com
   um receptor local.
-- **Helper polkit**: o helper foi testado direto como root (num contêiner) e o `pkexec` disparado pelo
-  serviço de usuário abriu a janela de senha do GNOME, mas o caminho completo **pacote instalado →
-  política → helper** só fica conferido depois de instalar a 0.5.0. Sem o pacote (rodando via `cargo`), as
-  ações de sistema caem no `systemctl` direto, que pede autorização ao polkit por conta própria.
+- **Helper polkit**: o helper foi testado direto como root (num contêiner). Com a 0.5.0 instalada, o
+  `pkexec` falhou com "pkexec must be setuid root" porque o `pulse.service` tinha `NoNewPrivileges=yes`;
+  a 0.5.1 tira essa opção (e, se o pkexec continuar bloqueado, as ações em serviços caem no `systemctl`,
+  que pede autorização ao polkit pelo D-Bus). O fluxo pacote → política → helper com a janela de senha
+  ainda precisa ser conferido com a correção instalada.
 - **SMART**: implementado via `smartctl`, mas **não testado em hardware real** (o smartmontools não
   está instalado na máquina de desenvolvimento; só o parser foi testado com saídas de exemplo). Ler SMART
   normalmente exige root ou o grupo `disk`.

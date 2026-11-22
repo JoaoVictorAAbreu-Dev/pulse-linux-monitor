@@ -888,3 +888,15 @@ fn phase5_remote_machine_proxy() {
     let (_, _, list) = req(&b, "GET", "/api/remotes", &h, "");
     assert!(!list.contains(&tok_a), "token remoto nunca aparece");
 }
+
+#[test]
+fn units_allow_pkexec() {
+    // NoNewPrivileges=yes impede o pkexec (setuid) de virar root: as ações de
+    // sistema e o eBPF falhariam com "pkexec must be setuid root".
+    for unit in [
+        include_str!("../../../packaging/pulse.service"),
+        include_str!("../../../packaging/deb/pulse.service"),
+    ] {
+        assert!(!unit.lines().any(|l| l.trim() == "NoNewPrivileges=yes"));
+    }
+}

@@ -8,7 +8,8 @@ Type=simple
 ExecStart=/usr/bin/pulse --port 7878
 Restart=on-failure
 RestartSec=3
-NoNewPrivileges=yes
+# Sem NoNewPrivileges: o pkexec (setuid) precisa ganhar privilégio para as
+# ações de sistema e a medição eBPF, sempre com senha via polkit.
 UMask=0077
 
 [Install]
