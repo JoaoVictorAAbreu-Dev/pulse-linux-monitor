@@ -93,8 +93,9 @@ incompatível).
 **Status (21/11/2026):** 5.1, 5.2 e 5.3 implementados; 5.4 decidido (não usar). Validado localmente
 com clippy `-D warnings`, testes unitários e de integração (incluindo um teste com dois daemons para o
 repasse), lintian sem avisos, interface conferida em Chromium headless e testes manuais em contêiner
-(túnel SSH com queda/reconexão; helper e bpftrace como root). Falta conferir o fluxo pkexec → helper com
-o pacote instalado.
+(túnel SSH com queda/reconexão; helper e bpftrace como root). O fluxo pkexec → helper com o pacote
+instalado foi conferido em 22/11/2026 na 0.5.1 (a 0.5.0 tinha `NoNewPrivileges=yes` no serviço, que
+bloqueava o pkexec).
 
 - **5.1 Helper polkit** — `pulse-helper` em `/usr/libexec/pulse-monitor/` com a política
   `io.github.pulse-monitor.policy` (ações `manage-units` e `netprobe`, `auth_admin_keep`). O daemon chama
